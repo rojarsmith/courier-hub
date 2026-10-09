@@ -1,0 +1,262 @@
+openapi: 3.0.3
+info:
+  title: Courier Hub
+  version: 0.1.0
+  description: >-
+    Authenticated asynchronous plain-text email relay. Acceptance into the durable
+    queue does not imply SMTP acceptance or inbox delivery. One configured SMTP
+    account and one shared API key per process.
+servers:
+  - url: http://127.0.0.1:8080
+security:
+  - bearerAuth: []
+paths:
+  /healthz:
+    get:
+      operationId: health
+      security: []
+      summary: Check API/database health (does not test SMTP)
+      responses:
+        '200':
+          description: API and database available
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/emails:
+    post:
+      operationId: submitEmail
+      summary: Submit a plain-text email for asynchronous delivery
+      description: >-
+        Request body is limited to 64 KiB including JSON encoding. Recipients,
+        subject and text have byte limits enforced by the service. Sender and SMTP
+        credentials come exclusively from server configuration.
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: false
+          description: >-
+            Same key and same parsed field values return the existing job, including
+            completed jobs. Different content returns 409. Keys expire when their
+            terminal job is removed by the configured retention policy (24h default).
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+            pattern: '^[A-Za-z0-9_.:-]+$'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Email'
+      responses:
+        '202':
+          description: Durably accepted, or replay of a retained job
+          headers:
+            Location:
+              description: Relative URL for querying this job
+              schema:
+                type: string
+                example: /v1/jobs/38af9c6e-930c-4d71-8f6c-7ee385bc84c8
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '408':
+          $ref: '#/components/responses/Timeout'
+        '409':
+          description: Idempotency key already used for different email content
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: JSON exceeds 64 KiB
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '415':
+          description: Content-Type must be application/json or a JSON media type
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '422':
+          description: Invalid or unexpected fields, addresses, content, or recipient domain
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/jobs/{id}:
+    get:
+      operationId: getJob
+      summary: Get delivery status without exposing email content
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Current job status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Job not found or expired
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '408':
+          $ref: '#/components/responses/Timeout'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: A server-configured random API key, not a JWT
+  schemas:
+    Email:
+      type: object
+      additionalProperties: false
+      required: [to, subject, text]
+      properties:
+        to:
+          type: array
+          minItems: 1
+          maxItems: 10
+          items:
+            type: string
+            format: email
+            description: Bare address without display name; at most 254 UTF-8 bytes
+        subject:
+          type: string
+          description: Nonblank, at most 998 UTF-8 bytes, no control characters
+        text:
+          type: string
+          description: Nonblank, at most 49152 UTF-8 bytes, no NUL characters
+      example:
+        to: [recipient@example.com]
+        subject: Hello
+        text: Hello from Courier Hub
+    Job:
+      type: object
+      required: [id, status, created_at, updated_at, error_code]
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [queued, sending, sent, failed, unknown]
+          description: >-
+            sent means SMTP accepted, not inbox delivery. unknown means acceptance
+            is uncertain. Delivery is not automatically retried.
+        created_at:
+          type: integer
+          format: int64
+          description: UTC Unix seconds
+        updated_at:
+          type: integer
+          format: int64
+          description: UTC Unix seconds
+        error_code:
+          type: string
+          nullable: true
+          enum: [smtp_rejected, delivery_uncertain, invalid_message, interrupted, null]
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+  responses:
+    InvalidRequest:
+      description: Malformed JSON, invalid idempotency key or invalid job ID
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Missing or invalid Bearer API key
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+            example: Bearer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    RateLimited:
+      description: Shared API-key token bucket exhausted; submission and polling share the budget
+      headers:
+        Retry-After:
+          schema:
+            type: string
+            example: '60'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unavailable:
+      description: Queue full or service health unavailable
+      headers:
+        Retry-After:
+          description: Present when the queue is full
+          schema:
+            type: string
+            example: '5'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Timeout:
+      description: Request timed out; repeat submissions using the same Idempotency-Key
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    InternalError:
+      description: Internal storage error; private details are not returned
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
