@@ -256,7 +256,227 @@ This version uses one process, one SMTP configuration, and one shared API key, w
 
 SMTP provides no end-to-end exactly-once guarantee. This version does not automatically retry delivery, even after an explicit rejection. For `unknown` jobs, check the provider's delivery records before deciding to submit again with a new key. The stable Message-ID helps investigation but does not guarantee provider deduplication.
 
+## Deploy to an Ubuntu VPS
+
+This walkthrough targets Ubuntu 24.04 LTS with systemd. Run the commands in Bash on the VPS, using a normal administrative account with `sudo`, rather than in local Windows PowerShell. Build on the VPS to match its CPU architecture and Linux libraries. Compilation can need more RAM or swap than running the service.
+
+Use this layout: **Internet → Nginx HTTPS :443 → Courier Hub 127.0.0.1:8080 → third-party SMTP**. systemd starts the service at boot and restarts it after a failure.
+
+| Location | Purpose |
+| --- | --- |
+| `~/courier-hub` | Source checkout owned by your administrative account |
+| `/opt/courier-hub/courier-hub` | Release executable, owned by root |
+| `/etc/courier-hub/service.env` | Private runtime settings, owned by root, mode 0600 |
+| `/var/lib/courier-hub` | SQLite jobs, owned by the service account, mode 0700 |
+| `/etc/systemd/system/courier-hub.service` | Service unit |
+| `/etc/nginx/sites-available/courier-hub` | Public HTTPS proxy configuration |
+
+The shared, secret-free templates are in [deploy/ubuntu](deploy/ubuntu). The instructions below do not deploy anything automatically from your development machine.
+
+### 1. Prepare DNS, packages, and the firewall
+
+Point an API hostname such as `api.example.com` at the VPS public IP with a DNS A record. Add an AAAA record only if the server has working public IPv6. For initial certificate issuance, DNS and any CDN/proxy must let HTTP requests to the ACME challenge path reach the VPS. Replace `api.example.com` below with your hostname and keep the same Bash session for the deployment commands.
+
+```sh
+# Connect from your own machine; replace the account and IP.
+ssh ubuntu@VPS_IP
+
+# Run the remaining commands on Ubuntu.
+api_domain=api.example.com
+sudo apt update
+sudo apt install -y build-essential curl git ca-certificates pkg-config nginx ufw snapd openssl
+
+# Allow your actual SSH port BEFORE enabling UFW.
+sudo ufw allow OpenSSH
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw enable
+sudo ufw status
+```
+
+If SSH uses a port other than 22, allow that port before enabling the firewall and confirm a second SSH connection works. Apply equivalent inbound rules in the VPS provider's firewall. Do not expose port 8080. The VPS must also permit outbound connections to your provider's SMTP submission port, usually 587 or 465; check provider restrictions if these connections fail. UFW setup follows the [Ubuntu firewall guide](https://ubuntu.com/server/docs/how-to/security/firewalls/).
+
+### 2. Build the Linux executable
+
+```sh
+rustup_script=$(mktemp)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$rustup_script"
+sh "$rustup_script" -y --profile minimal --default-toolchain 1.88.0
+rm -f "$rustup_script"
+. "$HOME/.cargo/env"
+
+git clone https://github.com/rojarsmith/courier-hub.git "$HOME/courier-hub"
+cd "$HOME/courier-hub"
+cargo build --release --locked
+```
+
+For a private repository, configure a dedicated read-only [GitHub deploy key](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/managing-deploy-keys) on the VPS and use `git@github.com:rojarsmith/courier-hub.git` as the clone URL. Keep that private key outside the checkout. The runtime service account needs no GitHub key or Rust compiler. The Rust installer is described in the [official installation guide](https://rust-lang.org/tools/install/).
+
+### 3. Install the executable and private settings
+
+Run from the source checkout. These account and configuration installation commands are for the first deployment; for later releases, use the update procedure below.
+
+```sh
+sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin courier-hub
+sudo install -d -o root -g root -m 755 /opt/courier-hub
+sudo install -o root -g root -m 755 target/release/courier-hub /opt/courier-hub/courier-hub
+sudo install -d -o root -g root -m 700 /etc/courier-hub
+sudo install -o root -g root -m 600 deploy/ubuntu/.env.example /etc/courier-hub/service.env
+openssl rand -hex 32
+sudo nano /etc/courier-hub/service.env
+```
+
+Set `API_KEY` to the generated value and replace all SMTP account placeholders. Keep `BIND_ADDR=127.0.0.1:8080` and `DATA_DIR=/var/lib/courier-hub`. The private file is outside Git; never put its contents in deployment scripts or commits. See the SMTP setup section for Gmail app passwords or your domain mailbox provider's settings.
+
+The file uses systemd `EnvironmentFile` syntax: one `KEY=value` per line, without `export`, command substitution, or variable expansion. Quote a value containing spaces, for example `SMTP_FROM="Courier Hub <sender@example.com>"`. systemd reads the root-only file before starting the unprivileged process; do not `source` it in a shell. This deployment uses environment injection and does not need `/opt/courier-hub/.env`.
+
+### 4. Start the systemd service
+
+```sh
+sudo install -o root -g root -m 644 deploy/ubuntu/courier-hub.service /etc/systemd/system/courier-hub.service
+sudo systemd-analyze verify /etc/systemd/system/courier-hub.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now courier-hub
+sudo systemctl status courier-hub --no-pager
+curl --fail --silent --show-error http://127.0.0.1:8080/healthz
+```
+
+The [service template](deploy/ubuntu/courier-hub.service) creates the private state directory, restricts filesystem writes to that directory and private temporary storage, and runs as `courier-hub`. Its 150-second stop timeout allows the application's maximum 120-second SMTP attempt to finish. `/healthz` should return `{"status":"ok"}`; it checks the API/database, not SMTP credentials. Environment and filesystem options are documented by [systemd](https://github.com/systemd/systemd/blob/v255/man/systemd.exec.xml).
+
+### 5. Obtain a certificate, then enable HTTPS
+
+First install the [HTTP bootstrap configuration](deploy/ubuntu/nginx-http.conf). It serves only ACME challenge files and redirects other requests toward HTTPS, so the API is not exposed over plaintext HTTP while the certificate is being obtained.
+
+```sh
+sudo install -d -o root -g root -m 755 /var/www/certbot
+sed "s/api\.example\.com/$api_domain/g" deploy/ubuntu/nginx-http.conf | sudo tee /etc/nginx/sites-available/courier-hub > /dev/null
+sudo ln -s /etc/nginx/sites-available/courier-hub /etc/nginx/sites-enabled/courier-hub
+sudo nginx -t
+sudo systemctl enable --now nginx
+sudo systemctl reload nginx
+
+sudo snap install --classic certbot
+sudo /snap/bin/certbot certonly --webroot -w /var/www/certbot --cert-name "$api_domain" -d "$api_domain"
+```
+
+Complete Certbot's email and terms prompts. Continue only after certificate issuance succeeds. HTTP-01 needs inbound port 80 and correct DNS; see [Ubuntu's TLS guide](https://ubuntu.com/server/docs/how-to/security/obtain-tls-certificates/) and [Certbot's installation instructions](https://certbot.eff.org/instructions?ws=nginx&os=snap).
+
+Then install the [HTTPS configuration](deploy/ubuntu/nginx.conf), substituting the hostname in both the server name and certificate paths:
+
+```sh
+sed "s/api\.example\.com/$api_domain/g" deploy/ubuntu/nginx.conf | sudo tee /etc/nginx/sites-available/courier-hub > /dev/null
+sudo nginx -t
+sudo systemctl reload nginx
+curl --fail --silent --show-error "https://$api_domain/healthz"
+
+sudo install -d -o root -g root -m 755 /etc/letsencrypt/renewal-hooks/deploy
+sudo install -o root -g root -m 755 deploy/ubuntu/reload-nginx.sh /etc/letsencrypt/renewal-hooks/deploy/courier-hub-nginx
+sudo /snap/bin/certbot renew --dry-run --run-deploy-hooks
+systemctl list-timers --all
+```
+
+Confirm the Certbot renewal timer is present. The deploy hook checks and reloads Nginx after certificate renewal; the dry run also exercises that hook. Keep the HTTP ACME path and port 80 available for renewals. See [Certbot's renewal documentation](https://eff-certbot.readthedocs.io/en/stable/using.html#renewing-certificates).
+
+The HTTPS template forwards authentication headers, caps bodies at 64 KiB, disables upstream retries, and adds a per-IP edge limit of 10 requests/second with a burst of 20. Tune that edge limit for clients sharing a NAT address; the application's API-key rate budget still applies. These directives follow the [Nginx proxy](https://nginx.org/en/docs/http/ngx_http_proxy_module.html) and [rate-limit](https://nginx.org/en/docs/http/ngx_http_limit_req_module.html) documentation. Always call the API with an `https://` URL directly; a redirect cannot protect a key already sent over HTTP.
+
+### 6. Verify authenticated delivery
+
+First, an unauthenticated submission should return 401:
+
+```sh
+curl -i "https://$api_domain/v1/emails" -H 'Content-Type: application/json' --data '{}'
+```
+
+Then use a mailbox you own as the recipient. This Bash example reads the key without echoing it and sends the authentication header through stdin rather than including the key in command-line arguments:
+
+```sh
+read -r -s -p 'API key: ' courier_api_key
+printf '\n'
+request_id=$(cat /proc/sys/kernel/random/uuid)
+printf 'Authorization: Bearer %s\n' "$courier_api_key" | curl --silent --show-error --fail-with-body \
+  --header @- --header 'Content-Type: application/json' \
+  --header "Idempotency-Key: $request_id" \
+  --data '{"to":["recipient@example.com"],"subject":"VPS delivery test","text":"Hello from Courier Hub on Ubuntu."}' \
+  "https://$api_domain/v1/emails"
+
+read -r -p 'Job ID from the response: ' job_id
+printf 'Authorization: Bearer %s\n' "$courier_api_key" | curl --fail --silent --show-error \
+  --header @- "https://$api_domain/v1/jobs/$job_id"
+unset courier_api_key
+```
+
+Expect 202 on submission, then poll for `sent`, `failed`, or `unknown`. Preserve `$request_id` and identical content if resubmitting after a connection error. Check SMTP records before retrying an `unknown` job. Avoid verbose curl output with credentials, and do not put the key in a URL.
+
+### 7. Back up, update, and roll back
+
+For a consistent offline SQLite backup, stop the service and archive the entire state directory, including any WAL files. The commands cause a brief service interruption; run the final start command even if archiving fails.
+
+```sh
+sudo install -d -o root -g root -m 700 /var/backups/courier-hub
+backup_archive="/var/backups/courier-hub/jobs-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
+sudo systemctl stop courier-hub
+sudo tar -C /var/lib -czf "$backup_archive" courier-hub
+sudo chmod 600 "$backup_archive"
+sudo systemctl start courier-hub
+```
+
+Keep backups private and encrypted if required; they contain email content. Back up `/etc/courier-hub/service.env` separately to a private secret store. Do not copy a live database file by itself.
+
+Build updates as your administrative account while the existing service keeps running, then replace the executable after a graceful stop:
+
+```sh
+cd "$HOME/courier-hub"
+git pull --ff-only origin main
+cargo test --locked --all-targets
+cargo build --release --locked
+sudo install -o root -g root -m 755 target/release/courier-hub /opt/courier-hub/courier-hub.new
+sudo cp -p /opt/courier-hub/courier-hub /opt/courier-hub/courier-hub.previous
+sudo systemctl stop courier-hub
+sudo mv /opt/courier-hub/courier-hub.new /opt/courier-hub/courier-hub
+sudo systemctl start courier-hub
+curl --fail --silent --show-error http://127.0.0.1:8080/healthz
+```
+
+If the new executable fails, restore the previous one:
+
+```sh
+sudo systemctl stop courier-hub
+sudo cp -p /opt/courier-hub/courier-hub.previous /opt/courier-hub/courier-hub.new
+sudo mv /opt/courier-hub/courier-hub.new /opt/courier-hub/courier-hub
+sudo systemctl reset-failed courier-hub
+sudo systemctl start courier-hub
+```
+
+Keep private settings and the state directory across releases. Review unit/proxy template changes separately before reinstalling them; after editing a unit, run `daemon-reload`. Changing `service.env` requires a service restart. A binary rollback does not reverse future database schema changes, so keep a state backup before upgrades. Run only one instance against the state directory.
+
+### Troubleshooting
+
+```sh
+sudo journalctl -u courier-hub -n 100 --no-pager
+sudo nginx -t
+sudo tail -n 50 /var/log/nginx/courier-hub.error.log
+sudo ss -ltnp
+```
+
+| Symptom | Check |
+| --- | --- |
+| Service fails at startup | Missing/placeholder API key, SMTP settings, root-owned executable, private file syntax, or state-directory permissions. After correcting repeated failures, run `sudo systemctl reset-failed courier-hub` then start it. |
+| Nginx returns 502 | Check systemd and `curl http://127.0.0.1:8080/healthz`; both service and proxy must use port 8080. |
+| Certificate issuance/renewal fails | Check A/AAAA records, port 80 in both firewalls, ACME webroot, and any CDN routing. |
+| Job is failed/unknown | Check provider authentication policy, app password, TLS mode, and outbound SMTP restrictions. `/healthz` does not test SMTP. |
+| Request returns 413/429 | Check the proxy body/per-IP limits and the API's own body/key limits. |
+| Process runs out of memory during a build | Reduce Cargo parallelism with `cargo build --release --locked -j 1` and check RAM/swap. |
+
+To probe Gmail's STARTTLS connectivity without sending account credentials:
+
+```sh
+openssl s_client -starttls smtp -connect smtp.gmail.com:587 -servername smtp.gmail.com -verify_return_error < /dev/null
+```
+
+Use your provider's hostname instead. For implicit TLS on port 465, omit `-starttls smtp` and change the port. Domain, certificate, SMTP account, and VPS firewall checks must be performed on the actual server; the development environment does not verify your VPS deployment.
+
 ## Development and verification
+
 
 ```sh
 cargo fmt --all -- --check

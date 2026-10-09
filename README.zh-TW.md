@@ -256,6 +256,225 @@ git status --short
 
 SMTP 不提供端到端 exactly-once 保證。本版不自動重試寄送，連明確拒絕都先留給使用者決定；`unknown` 先核對供應商寄送紀錄再決定是否用新的 key 重送。穩定的 Message-ID 可供查核，但不保證供應商去重。
 
+## 部署到 Ubuntu VPS
+
+以下流程以 Ubuntu 24.04 LTS 與 systemd 為目標。指令應在 VPS 的 Bash／SSH 工作階段內，以有 `sudo` 權限的一般管理帳號執行，不是在本機 Windows PowerShell 執行。在 VPS 上建置，可符合該機器的 CPU 架構與 Linux 函式庫；編譯時可能需要比執行服務更多的記憶體或 swap。
+
+部署架構為：**Internet → Nginx HTTPS :443 → Courier Hub 127.0.0.1:8080 → 第三方 SMTP**。systemd 負責開機啟動，以及程序失敗後重新啟動。
+
+| 路徑 | 用途 |
+| --- | --- |
+| `~/courier-hub` | 原始碼，由一般管理帳號持有 |
+| `/opt/courier-hub/courier-hub` | release 執行檔，由 root 持有 |
+| `/etc/courier-hub/service.env` | 私人設定檔，由 root 持有，權限 0600 |
+| `/var/lib/courier-hub` | SQLite 工作資料，由服務帳號持有，權限 0700 |
+| `/etc/systemd/system/courier-hub.service` | 服務單元設定 |
+| `/etc/nginx/sites-available/courier-hub` | 對外 HTTPS 反向代理設定 |
+
+兩種語言共用 [deploy/ubuntu](deploy/ubuntu) 中不含秘密的範本。以下是操作說明，不會從開發電腦自動部署到你的 VPS。
+
+### 1. 準備 DNS、套件與防火牆
+
+將 API 網域（例如 `api.example.com`）的 DNS A 紀錄指向 VPS 公開 IP。只有伺服器確實能使用公開 IPv6 時才加入 AAAA 紀錄。第一次申請憑證時，DNS 與 CDN／代理必須讓 ACME 驗證路徑的 HTTP 請求到達 VPS。將下方的 `api.example.com` 改成自己的網域，並在同一個 Bash 工作階段完成部署。
+
+```sh
+# 從自己的電腦連線；替換帳號與 IP。
+ssh ubuntu@VPS_IP
+
+# 以下指令在 Ubuntu 執行。
+api_domain=api.example.com
+sudo apt update
+sudo apt install -y build-essential curl git ca-certificates pkg-config nginx ufw snapd openssl
+
+# 啟用 UFW 前，先放行實際使用的 SSH 連接埠。
+sudo ufw allow OpenSSH
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw enable
+sudo ufw status
+```
+
+若 SSH 不是使用 22，啟用防火牆前先放行正確連接埠，並確認第二個 SSH 連線可成功登入。VPS 供應商的防火牆也要開放對應的 inbound 規則。不要開放 8080 對外連線。VPS 另外需要能向郵件供應商的 SMTP submission 連接埠（通常 587 或 465）建立 outbound 連線；失敗時確認供應商是否限制 SMTP。UFW 操作依據 [Ubuntu 防火牆文件](https://ubuntu.com/server/docs/how-to/security/firewalls/)。
+
+### 2. 建置 Linux 執行檔
+
+```sh
+rustup_script=$(mktemp)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$rustup_script"
+sh "$rustup_script" -y --profile minimal --default-toolchain 1.88.0
+rm -f "$rustup_script"
+. "$HOME/.cargo/env"
+
+git clone https://github.com/rojarsmith/courier-hub.git "$HOME/courier-hub"
+cd "$HOME/courier-hub"
+cargo build --release --locked
+```
+
+若 repository 是 private，先在 VPS 設定專用、唯讀的 [GitHub deploy key](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/managing-deploy-keys)，再將 clone URL 改成 `git@github.com:rojarsmith/courier-hub.git`。私鑰放在 checkout 之外。實際執行服務的帳號不需要 GitHub 私鑰或 Rust 編譯器。Rust 安裝方式見 [官方說明](https://rust-lang.org/tools/install/)。
+
+### 3. 安裝執行檔與私人設定
+
+在原始碼目錄執行。以下建立帳號與安裝設定的指令適用於第一次部署；之後更新請使用下方的更新流程。
+
+```sh
+sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin courier-hub
+sudo install -d -o root -g root -m 755 /opt/courier-hub
+sudo install -o root -g root -m 755 target/release/courier-hub /opt/courier-hub/courier-hub
+sudo install -d -o root -g root -m 700 /etc/courier-hub
+sudo install -o root -g root -m 600 deploy/ubuntu/.env.example /etc/courier-hub/service.env
+openssl rand -hex 32
+sudo nano /etc/courier-hub/service.env
+```
+
+將產生的值填入 `API_KEY`，並替換所有 SMTP 帳號佔位值。保留 `BIND_ADDR=127.0.0.1:8080` 與 `DATA_DIR=/var/lib/courier-hub`。私人設定檔在 Git 之外，不要將內容寫進部署腳本或 commit。Gmail 應用程式密碼與自有網域信箱設定請參考前面的 SMTP 章節。
+
+此檔案使用 systemd `EnvironmentFile` 格式：每行 `KEY=value`，不加 `export`，也不做指令替換或變數展開。含空格的值要加引號，例如 `SMTP_FROM="Courier Hub <sender@example.com>"`。systemd 會在啟動低權限程序之前讀取 root 專用檔案；不要在 shell 中 `source` 它。本部署方式透過環境變數注入設定，不需要建立 `/opt/courier-hub/.env`。
+
+### 4. 啟動 systemd 服務
+
+```sh
+sudo install -o root -g root -m 644 deploy/ubuntu/courier-hub.service /etc/systemd/system/courier-hub.service
+sudo systemd-analyze verify /etc/systemd/system/courier-hub.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now courier-hub
+sudo systemctl status courier-hub --no-pager
+curl --fail --silent --show-error http://127.0.0.1:8080/healthz
+```
+
+[服務範本](deploy/ubuntu/courier-hub.service) 會建立私人資料目錄、將檔案寫入限制在該目錄與私人暫存空間，並以 `courier-hub` 帳號執行。停止逾時設為 150 秒，讓應用程式最長 120 秒的 SMTP 嘗試有時間結束。`/healthz` 應回傳 `{"status":"ok"}`；它只檢查 API／資料庫，不會驗證 SMTP 帳密。環境變數與檔案系統選項見 [systemd 文件](https://github.com/systemd/systemd/blob/v255/man/systemd.exec.xml)。
+
+### 5. 取得憑證後啟用 HTTPS
+
+先安裝 [HTTP 初始化範本](deploy/ubuntu/nginx-http.conf)。這個範本只提供 ACME 驗證檔案，其餘請求轉向 HTTPS，因此在申請憑證期間不會透過明文 HTTP 開放 API。
+
+```sh
+sudo install -d -o root -g root -m 755 /var/www/certbot
+sed "s/api\.example\.com/$api_domain/g" deploy/ubuntu/nginx-http.conf | sudo tee /etc/nginx/sites-available/courier-hub > /dev/null
+sudo ln -s /etc/nginx/sites-available/courier-hub /etc/nginx/sites-enabled/courier-hub
+sudo nginx -t
+sudo systemctl enable --now nginx
+sudo systemctl reload nginx
+
+sudo snap install --classic certbot
+sudo /snap/bin/certbot certonly --webroot -w /var/www/certbot --cert-name "$api_domain" -d "$api_domain"
+```
+
+完成 Certbot 的 email 與服務條款提示，只有成功取得憑證後才繼續。HTTP-01 驗證需要正確 DNS 與 inbound 80；參考 [Ubuntu TLS 文件](https://ubuntu.com/server/docs/how-to/security/obtain-tls-certificates/) 與 [Certbot 安裝說明](https://certbot.eff.org/instructions?ws=nginx&os=snap)。
+
+接著安裝 [HTTPS 範本](deploy/ubuntu/nginx.conf)，替換 server name 與憑證路徑中的網域：
+
+```sh
+sed "s/api\.example\.com/$api_domain/g" deploy/ubuntu/nginx.conf | sudo tee /etc/nginx/sites-available/courier-hub > /dev/null
+sudo nginx -t
+sudo systemctl reload nginx
+curl --fail --silent --show-error "https://$api_domain/healthz"
+
+sudo install -d -o root -g root -m 755 /etc/letsencrypt/renewal-hooks/deploy
+sudo install -o root -g root -m 755 deploy/ubuntu/reload-nginx.sh /etc/letsencrypt/renewal-hooks/deploy/courier-hub-nginx
+sudo /snap/bin/certbot renew --dry-run --run-deploy-hooks
+systemctl list-timers --all
+```
+
+確認排程中有 Certbot 的自動續期 timer。deploy hook 會在憑證續期後檢查並 reload Nginx，dry run 也會測試該 hook。續期時仍需保留 HTTP ACME 路徑與 80 連接埠；參考 [Certbot 續期文件](https://eff-certbot.readthedocs.io/en/stable/using.html#renewing-certificates)。
+
+HTTPS 範本會轉送驗證 header、將 request body 限制為 64 KiB、關閉 upstream 重試，並加入每 IP 每秒 10 個請求、突發 20 個的入口限流。多個客戶端共用 NAT IP 時請依流量調整；應用程式的 API key 流量上限仍然生效。設定依據 [Nginx 反向代理](https://nginx.org/en/docs/http/ngx_http_proxy_module.html) 與 [限流](https://nginx.org/en/docs/http/ngx_http_limit_req_module.html) 文件。呼叫 API 時直接使用 `https://` URL；轉址無法保護已經透過 HTTP 傳出的金鑰。
+
+### 6. 驗證權限與實際寄送
+
+先確認未提供金鑰的提交回傳 401：
+
+```sh
+curl -i "https://$api_domain/v1/emails" -H 'Content-Type: application/json' --data '{}'
+```
+
+接著將收件人改成自己擁有的測試信箱。此 Bash 範例讀取金鑰時不回顯，並透過 stdin 傳遞驗證 header，不將金鑰放在指令列參數中：
+
+```sh
+read -r -s -p 'API key: ' courier_api_key
+printf '\n'
+request_id=$(cat /proc/sys/kernel/random/uuid)
+printf 'Authorization: Bearer %s\n' "$courier_api_key" | curl --silent --show-error --fail-with-body \
+  --header @- --header 'Content-Type: application/json' \
+  --header "Idempotency-Key: $request_id" \
+  --data '{"to":["recipient@example.com"],"subject":"VPS delivery test","text":"Hello from Courier Hub on Ubuntu."}' \
+  "https://$api_domain/v1/emails"
+
+read -r -p 'Job ID from the response: ' job_id
+printf 'Authorization: Bearer %s\n' "$courier_api_key" | curl --fail --silent --show-error \
+  --header @- "https://$api_domain/v1/jobs/$job_id"
+unset courier_api_key
+```
+
+提交應回傳 202，再查詢到 `sent`、`failed` 或 `unknown`。因連線錯誤重送同一份內容時，保留 `$request_id`。`unknown` 工作要先查核 SMTP 紀錄再決定是否重送。帶有帳密時不要使用 verbose curl，也不要將金鑰放在 URL。
+
+### 7. 備份、更新與回復
+
+要取得一致的離線 SQLite 備份，先停止服務，再封存整個資料目錄，包含可能存在的 WAL 檔案。以下會短暫中斷服務；即使封存失敗，也要執行最後的 start 指令。
+
+```sh
+sudo install -d -o root -g root -m 700 /var/backups/courier-hub
+backup_archive="/var/backups/courier-hub/jobs-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
+sudo systemctl stop courier-hub
+sudo tar -C /var/lib -czf "$backup_archive" courier-hub
+sudo chmod 600 "$backup_archive"
+sudo systemctl start courier-hub
+```
+
+備份含信件內容，請限制存取並按需求加密；`/etc/courier-hub/service.env` 另外備份到私人的 secret store。不要只複製使用中的資料庫單一檔案。
+
+以一般管理帳號建置更新，期間讓既有服務繼續運作，再優雅停止並替換執行檔：
+
+```sh
+cd "$HOME/courier-hub"
+git pull --ff-only origin main
+cargo test --locked --all-targets
+cargo build --release --locked
+sudo install -o root -g root -m 755 target/release/courier-hub /opt/courier-hub/courier-hub.new
+sudo cp -p /opt/courier-hub/courier-hub /opt/courier-hub/courier-hub.previous
+sudo systemctl stop courier-hub
+sudo mv /opt/courier-hub/courier-hub.new /opt/courier-hub/courier-hub
+sudo systemctl start courier-hub
+curl --fail --silent --show-error http://127.0.0.1:8080/healthz
+```
+
+若新執行檔失敗，還原上一版：
+
+```sh
+sudo systemctl stop courier-hub
+sudo cp -p /opt/courier-hub/courier-hub.previous /opt/courier-hub/courier-hub.new
+sudo mv /opt/courier-hub/courier-hub.new /opt/courier-hub/courier-hub
+sudo systemctl reset-failed courier-hub
+sudo systemctl start courier-hub
+```
+
+更新時保留私人設定與資料目錄。unit／proxy 範本若有修改，另外審閱後再重新安裝；編輯 unit 後執行 `daemon-reload`。修改 `service.env` 需要重啟服務。執行檔回復不會逆轉未來可能的資料庫 schema 變更，因此升級前先備份資料。同一個資料目錄只執行一個服務實例。
+
+### 故障排查
+
+```sh
+sudo journalctl -u courier-hub -n 100 --no-pager
+sudo nginx -t
+sudo tail -n 50 /var/log/nginx/courier-hub.error.log
+sudo ss -ltnp
+```
+
+| 現象 | 檢查項目 |
+| --- | --- |
+| 服務啟動失敗 | API key 未填或仍是佔位值、SMTP 設定、root 持有的執行檔、私人設定格式或資料目錄權限。修正重複失敗原因後，執行 `sudo systemctl reset-failed courier-hub` 再啟動。 |
+| Nginx 回傳 502 | 檢查 systemd 與 `curl http://127.0.0.1:8080/healthz`；服務與代理需使用相同的 8080 連接埠。 |
+| 憑證申請／續期失敗 | 檢查 A／AAAA、兩層防火牆的 80 連接埠、ACME webroot 與 CDN 路由。 |
+| 工作為 failed／unknown | 檢查供應商驗證政策、應用程式密碼、TLS 模式與 outbound SMTP 限制；`/healthz` 不測試 SMTP。 |
+| 請求回傳 413／429 | 檢查代理的 body／每 IP 限流，以及 API 本身的 body／key 上限。 |
+| 建置時記憶體不足 | 使用 `cargo build --release --locked -j 1` 降低並行數，並檢查 RAM／swap。 |
+
+不傳送帳密的 Gmail STARTTLS 連線檢查：
+
+```sh
+openssl s_client -starttls smtp -connect smtp.gmail.com:587 -servername smtp.gmail.com -verify_return_error < /dev/null
+```
+
+使用自己的郵件供應商主機名稱替換範例。若使用 465 implicit TLS，移除 `-starttls smtp` 並更換連接埠。網域、憑證、SMTP 帳號與 VPS 防火牆需在實際伺服器驗證；開發環境無法確認你的 VPS 已成功部署。
+
 ## 開發與驗證
 
 ```sh
