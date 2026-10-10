@@ -163,90 +163,81 @@ Owning a domain does not provide a mail service by itself. Use the SMTP host, au
 
 `starttls` must successfully upgrade to TLS before sending credentials or email. `implicit` uses TLS from the start of the connection. Both validate the hostname and public CA certificate chain. Plaintext SMTP and disabling certificate validation are not supported. See the [lettre documentation](https://docs.rs/lettre/latest/lettre/transport/smtp/struct.AsyncSmtpTransport.html).
 
-### Gandi Mail
+### GoDaddy Professional Email (Titan)
 
-Use these settings only when **Gandi Mail hosts the mailbox**. Registering a domain at Gandi does not determine who hosts its email. You need an active mailbox, its full email address as the username, and its mailbox password, rather than your Gandi account password or API key. A forwarding address alone is not a mailbox. See [Gandi's email settings](https://docs.gandi.net/en/gandimail/standard_email_settings/) and [mailbox/forwarding FAQ](https://docs.gandi.net/en/gandimail/faq/general_questions.html).
+For a mailbox hosted by GoDaddy Professional Email powered by Titan, use the full mailbox address and its mailbox password, rather than your GoDaddy account password or API key. The mailbox hosting service determines the SMTP endpoint; the domain registrar alone does not. [GoDaddy's official settings](https://www.godaddy.com/en-uk/help/use-imap-settings-to-add-my-professional-email-powered-by-titan-to-a-client-32204) specify `smtpout.secureserver.net`, port 465, and SSL/TLS, which corresponds to `implicit` in Courier Hub:
 
 ```ini
-SMTP_HOST=mail.gandi.net
+SMTP_HOST=smtpout.secureserver.net
 SMTP_PORT=465
 SMTP_TLS=implicit
 SMTP_USERNAME=notifications@your-domain.example
-SMTP_PASSWORD="REPLACE_WITH_NEW_MAILBOX_PASSWORD"
+SMTP_PASSWORD="REPLACE_WITH_MAILBOX_PASSWORD"
 SMTP_FROM="Courier Hub <notifications@your-domain.example>"
 ```
 
-Alternatively, keep the same host and credentials and change **both** settings:
+Use the authenticated mailbox as `SMTP_FROM` for the initial test. Port 465 must use `SMTP_TLS=implicit`; pairing it with `starttls` can cause a timeout or handshake failure. The application selects TLS behavior from `SMTP_TLS` and does not correct a mismatched port automatically. The public configuration templates use these GoDaddy settings with account placeholders.
 
-```ini
-SMTP_PORT=587
-SMTP_TLS=starttls
-```
-
-| Setting | Correct pairing / meaning |
-| --- | --- |
-| `mail.gandi.net`, 465, `implicit` | TLS starts immediately when connecting |
-| `mail.gandi.net`, 587, `starttls` | SMTP must upgrade to TLS before authentication |
-| 465 with `starttls` | Incorrect pairing; can cause a timeout or handshake failure |
-| `smtpout.secureserver.net` | A [GoDaddy SMTP host](https://www.godaddy.com/en-in/help/use-imap-settings-to-add-my-professional-email-to-a-client-32204), not Gandi Mail; retain it only if that service actually hosts your mailbox |
-
-The application selects TLS behavior from `SMTP_TLS`; it does not correct a mismatched port automatically. Use the authenticated mailbox as `SMTP_FROM` for the initial test. `SMTP_FROM` supports the quoted display-name format above. Other service settings can retain the Ubuntu template values: `BIND_ADDR=127.0.0.1:8080`, `DATA_DIR=/var/lib/courier-hub`, SMTP timeout 30 seconds, 2 workers, 1000 pending jobs, 120 requests per minute, and 24-hour retention. An empty `ALLOWED_RECIPIENT_DOMAINS=` permits recipients at any domain.
-
-#### Check Gandi SMTP independently on the Ubuntu VPS
+#### Check GoDaddy SMTP independently on the Ubuntu VPS
 
 Run these checks in an interactive Bash terminal on the **actual VPS**. They bypass Courier Hub, Nginx, and the API key. `/healthz` does not test SMTP. Install the diagnostic tools if needed:
 
 ```sh
 sudo apt install -y openssl ca-certificates python3
-getent ahosts mail.gandi.net
+getent ahosts smtpout.secureserver.net
 ```
 
-1. **Check network access and TLS without credentials or sending mail.** Run the command for the port you intend to use:
+1. **Check network access and TLS without credentials or sending mail.**
 
 ```sh
-# Port 465: implicit TLS.
-timeout 15s openssl s_client -connect mail.gandi.net:465 \
-  -servername mail.gandi.net -verify_hostname mail.gandi.net \
-  -verify_return_error -brief < /dev/null
-
-# Port 587: required STARTTLS.
-timeout 15s openssl s_client -starttls smtp -connect mail.gandi.net:587 \
-  -servername mail.gandi.net -verify_hostname mail.gandi.net \
+# Port 465: implicit TLS, with certificate-chain and hostname verification.
+timeout 15s openssl s_client -connect smtpout.secureserver.net:465 \
+  -servername smtpout.secureserver.net -verify_hostname smtpout.secureserver.net \
   -verify_return_error -brief < /dev/null
 ```
 
 Look for an established TLS connection and `Verification: OK`, with no certificate error. This checks DNS, TCP connectivity, TLS, the public CA chain, and the server hostname; it does **not** prove your password works or that a message can be delivered. `timeout` exit code 124 means the check timed out. See [OpenSSL's `s_client` documentation](https://docs.openssl.org/3.0/man1/openssl-s_client/).
 
-2. **Check authentication, then optionally send one test message.** From the project root, run [scripts/check_gandi_smtp.py](scripts/check_gandi_smtp.py). It uses only Python standard-library modules. Enter the full mailbox address and password when prompted; the password is hidden, and credentials are not saved or passed as command arguments. The default checks TLS and authentication without sending mail. `--send` prompts for one recipient you control and sends one real test email.
+2. **Check authentication, then optionally send one test message.** From the project root, run [scripts/check_godaddy_smtp.py](scripts/check_godaddy_smtp.py). It uses Python's standard library and defaults to `smtpout.secureserver.net:465` with implicit TLS. Enter the full mailbox address and password when prompted; the password is hidden, and credentials are not saved or passed as command arguments. The default checks TLS and authentication without sending mail. `--send` prompts for one recipient you control and sends one real test email.
 
 ```sh
-# Port 465: TLS and authentication only; no email sent.
-python3 scripts/check_gandi_smtp.py
+# TLS and authentication only; no email sent.
+python3 -B scripts/check_godaddy_smtp.py
 
-# Port 587: required STARTTLS and authentication only.
-python3 scripts/check_gandi_smtp.py --tls starttls
+# Send one real test email after successful authentication.
+python3 -B scripts/check_godaddy_smtp.py --send
 
-# Optionally send one real test email after successful authentication.
-python3 scripts/check_gandi_smtp.py --send
-
-# Both options can be combined.
-python3 scripts/check_gandi_smtp.py --tls starttls --send
+# The SMTP hostname can also be specified explicitly.
+python3 -B scripts/check_godaddy_smtp.py --host smtpout.secureserver.net --send
 ```
 
-Run it in an interactive terminal (on Windows, use `python` instead of `python3`). Exit code 0 means the selected checks completed, 1 means a connection/TLS/SMTP failure, 2 means invalid input or no secure interactive input, and 130 means cancellation. No third-party packages or API key are needed.
+Run it in an interactive terminal (on Windows, use `python` instead of `python3`). No third-party packages or API key are needed. `--host` accepts a DNS hostname without a URL scheme, port, or path. `--tls implicit` selects port 465; `--tls starttls` selects port 587 and requires a TLS upgrade. Use the documented 465/implicit pairing for this GoDaddy service. `-B` prevents Python bytecode cache files.
 
-`Authentication OK (SMTP 235)` proves this VPS can authenticate to Gandi SMTP using the entered credentials. The default SSL context verifies certificates and hostnames; STARTTLS is mandatory in the 587 branch. The script does not read `service.env`, so success does not prove the service has loaded the same settings. SMTP acceptance still does not guarantee inbox delivery. This test covers outgoing SMTP; IMAP/POP receiving settings are separate. See [Python's SMTP client documentation](https://docs.python.org/3/library/smtplib.html) and [default TLS context](https://docs.python.org/3/library/ssl.html#ssl.create_default_context).
+A successful send prints output such as the following, without mailbox addresses or passwords. The negotiated TLS version can vary:
+
+```text
+Connecting to smtpout.secureserver.net:465 (implicit)...
+TLS OK: TLSv1.3
+Authentication OK (SMTP 235).
+SMTP accepted the test message. Check the inbox, spam folder, and bounces.
+```
+
+A VPS test of this host and the 465/implicit pairing completed TLS 1.3, SMTP authentication (235), and SMTP acceptance; receipt in a Gmail inbox was also confirmed. This is a verification of the tested account and delivery path, not a guarantee for every account or recipient. Private mailbox identifiers and the original terminal transcript are not stored in the repository.
+
+`TLS OK` establishes TLS connectivity; `Authentication OK` establishes login to the selected SMTP host. SMTP acceptance still does not guarantee inbox delivery, so check the receiving mailbox and spam folder for the subject **Courier Hub SMTP connection test**. The script does not read `service.env`; success does not prove the service has loaded the same settings. This test covers outgoing SMTP; IMAP/POP receiving settings are separate. See [Python's SMTP client documentation](https://docs.python.org/3/library/smtplib.html) and [default TLS context](https://docs.python.org/3/library/ssl.html#ssl.create_default_context).
+
+Exit code 0 means the selected checks completed, 1 means a connection/TLS/SMTP failure, 2 means invalid input or unavailable secure interactive input, and 130 means cancellation.
 
 | Result | What to check next |
 | --- | --- |
-| DNS lookup fails | VPS DNS resolver and the spelling of `mail.gandi.net` |
-| Connection refused / timeout | Outbound 465/587 access in VPS/provider firewalls, routing, and provider SMTP restrictions; opening inbound SMTP ports will not fix this client connection |
+| DNS lookup fails | VPS DNS resolver and the spelling of `smtpout.secureserver.net` |
+| Connection refused / timeout | Outbound 465 access in VPS/provider firewalls, routing, and provider SMTP restrictions; opening inbound SMTP ports will not fix this client connection |
 | Certificate error | Hostname, system clock, and installed CA certificates; keep certificate verification enabled |
-| `SMTPNotSupportedError` | Correct port/TLS mode and whether the endpoint advertises STARTTLS or AUTH |
-| Authentication rejected, often SMTP 535 | Full mailbox address, mailbox password, active mailbox, and SMTP protocol access; webmail login alone does not prove SMTP is enabled. Check [Gandi's protocol settings](https://docs.gandi.net/fr/gandimail/operations_courantes/param_webmail.html) |
+| `TLS OK`, then SMTP 535 | TLS succeeded, but login was rejected before sending. Verify the selected host belongs to the mailbox provider, the full mailbox address, mailbox password, and account access. A 535 alone does not prove the password is wrong. Check login through the provider's Webmail and contact support if necessary |
+| Client asks whether sign-in is required | Enable SMTP authentication in that client. The Python script already calls `smtp.login()`; this is not an extra provider-dashboard switch |
 | Sender / recipient / DATA rejection | Sender authorization, recipient address, provider policy, and quotas; common SMTP codes include 550, 553, and 554 |
 | SMTP accepted, but no message in the inbox | Spam folder, bounces, recipient filtering, and the provider's SPF/DKIM/DMARC guidance |
-| Direct test succeeds, but Courier Hub fails | Compare the private service settings with the tested values, restart the service, then submit a job and query its terminal status; a healthy API does not establish SMTP health |
+| Direct test succeeds, but Courier Hub fails | Compare the private service settings with the tested values, restart the service, then submit a job and query its terminal status; API health does not establish SMTP health |
 | Disconnect / timeout while sending or during QUIT | Acceptance may be uncertain; check the recipient and provider records before sending again |
 
 #### Apply the tested settings and rotate exposed credentials
@@ -263,7 +254,7 @@ sudo journalctl -u courier-hub -n 50 --no-pager
 
 Changing only `service.env` does not require `daemon-reload`; changing the unit file does. The environment file uses `KEY=value`, with `#` for comments, no `export`, and no shell expansion; do not `source` it. Quote values when needed according to [systemd's EnvironmentFile syntax](https://github.com/systemd/systemd/blob/v255/man/systemd.exec.xml). Never store real credentials in README or the public template.
 
-If a real SMTP password or API key has been pasted into a chat, screenshot, or log, replace the mailbox password at Gandi and generate a fresh API key with `openssl rand -hex 32` locally. Enter the new values in the private file, update API clients with the new key, and restart. Do not reuse or reproduce exposed values. No live Gandi connection or delivery is verified by these documentation examples; run the checks on your VPS with your private credentials.
+If a real SMTP password or API key has been pasted into a chat, screenshot, or log, replace the mailbox password through your mailbox provider and generate a fresh API key with `openssl rand -hex 32` locally. Enter the new values in the private file, update API clients with the new key, and restart. Do not reuse or reproduce exposed values. Provider account permissions, quotas, and delivery still require verification on the VPS with your private credentials.
 
 ## API contract
 
@@ -580,7 +571,7 @@ openssl s_client -starttls smtp -connect smtp.gmail.com:587 -servername smtp.gma
 
 Use your provider's hostname instead. For implicit TLS on port 465, omit `-starttls smtp` and change the port. Domain, certificate, SMTP account, and VPS firewall checks must be performed on the actual server; the development environment does not verify your VPS deployment.
 
-For Gandi Mail, follow the [independent TLS, authentication, and delivery checks](#check-gandi-smtp-independently-on-the-ubuntu-vps) above.
+For GoDaddy Email, follow the [independent TLS, authentication, and delivery checks](#check-godaddy-smtp-independently-on-the-ubuntu-vps) above.
 
 ## Development and verification
 

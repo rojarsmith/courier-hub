@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check Gandi SMTP interactively without saving credentials or using Courier Hub."""
+"""Check GoDaddy SMTP interactively without saving credentials or using Courier Hub."""
 
 import argparse
 import getpass
@@ -11,7 +11,7 @@ from email.message import EmailMessage
 from email.utils import formatdate, make_msgid, parseaddr
 
 
-HOST = "mail.gandi.net"
+HOST = "smtpout.secureserver.net"
 TIMEOUT_SECONDS = 15
 
 
@@ -36,6 +36,11 @@ def ehlo(smtp):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--host",
+        default=HOST,
+        help="SMTP DNS hostname (default: smtpout.secureserver.net)",
+    )
+    parser.add_argument(
         "--tls",
         choices=("implicit", "starttls"),
         default="implicit",
@@ -47,28 +52,51 @@ def main(argv=None):
         help="also send one real test email to a recipient entered interactively",
     )
     args = parser.parse_args(argv)
+    labels = args.host.split(".")
+    if (
+        not args.host
+        or len(args.host) > 253
+        or any(
+            not label
+            or len(label) > 63
+            or label.startswith("-")
+            or label.endswith("-")
+            or any(not (char.isascii() and (char.isalnum() or char == "-")) for char in label)
+            for label in labels
+        )
+    ):
+        parser.error("--host must be a DNS hostname without a scheme, port, or path")
     if not sys.stdin.isatty():
-        print("Run in an interactive terminal; credentials are never read from files or pipes.", file=sys.stderr)
+        print(
+            "Run in an interactive terminal; credentials are never read from files or pipes.",
+            file=sys.stderr,
+        )
         return 2
 
     stage = "Input"
     accepted = False
     try:
-        username = read_address("Full Gandi mailbox address: ")
+        username = read_address("Full mailbox address: ")
         # Abort rather than fall back to visible password input when no secure terminal exists.
         with warnings.catch_warnings():
             warnings.simplefilter("error", getpass.GetPassWarning)
             password = getpass.getpass("Mailbox password (hidden): ")
         if not password:
             raise ValueError("Mailbox password must not be empty.")
-        recipient = read_address("Test recipient you control (a real email will be sent): ") if args.send else None
+        recipient = (
+            read_address("Test recipient you control (a real email will be sent): ")
+            if args.send
+            else None
+        )
 
         stage = "Connection/TLS"
         context = ssl.create_default_context()
+        port = 465 if args.tls == "implicit" else 587
+        print(f"Connecting to {args.host}:{port} ({args.tls})...")
         if args.tls == "implicit":
-            smtp = smtplib.SMTP_SSL(HOST, 465, timeout=TIMEOUT_SECONDS, context=context)
+            smtp = smtplib.SMTP_SSL(args.host, port, timeout=TIMEOUT_SECONDS, context=context)
         else:
-            smtp = smtplib.SMTP(HOST, 587, timeout=TIMEOUT_SECONDS)
+            smtp = smtplib.SMTP(args.host, port, timeout=TIMEOUT_SECONDS)
         with smtp:
             ehlo(smtp)
             if args.tls == "starttls":
@@ -85,7 +113,7 @@ def main(argv=None):
                 message = EmailMessage()
                 message["From"] = username
                 message["To"] = recipient
-                message["Subject"] = "Gandi SMTP connection test"
+                message["Subject"] = "Courier Hub SMTP connection test"
                 message["Date"] = formatdate(localtime=False, usegmt=True)
                 message["Message-ID"] = make_msgid()
                 message.set_content("Independent SMTP test from Courier Hub diagnostic script.")
@@ -106,6 +134,13 @@ def main(argv=None):
     except ValueError:
         print("Invalid input: use a nonempty password and one bare email address per prompt.", file=sys.stderr)
         return 2
+    except smtplib.SMTPAuthenticationError as exc:
+        print(f"{stage} failed: {type(exc).__name__}, SMTP {exc.smtp_code}.", file=sys.stderr)
+        print(
+            "Check that the selected SMTP host belongs to your mailbox provider "
+            "and use the mailbox password.",
+            file=sys.stderr,
+        )
     except smtplib.SMTPResponseException as exc:
         print(f"{stage} failed: {type(exc).__name__}, SMTP {exc.smtp_code}.", file=sys.stderr)
     except (smtplib.SMTPException, OSError) as exc:
