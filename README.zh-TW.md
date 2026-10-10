@@ -503,7 +503,7 @@ unset courier_api_key
 
 提交應回傳 202，再查詢到 `sent`、`failed` 或 `unknown`。因連線錯誤重送同一份內容時，保留 `$request_id`。`unknown` 工作要先查核 SMTP 紀錄再決定是否重送。帶有帳密時不要使用 verbose curl，也不要將金鑰放在 URL。
 
-### 7. 備份、更新與回復
+### 7. 備份資料與私人設定
 
 要取得一致的離線 SQLite 備份，先停止服務，再封存整個資料目錄，包含可能存在的 WAL 檔案。以下會短暫中斷服務；即使封存失敗，也要執行最後的 start 指令。
 
@@ -518,32 +518,69 @@ sudo systemctl start courier-hub
 
 備份含信件內容，請限制存取並按需求加密；`/etc/courier-hub/service.env` 另外備份到私人的 secret store。不要只複製使用中的資料庫單一檔案。
 
-以一般管理帳號建置更新，期間讓既有服務繼續運作，再優雅停止並替換執行檔：
+### 8. 更新程式
+
+在 Ubuntu VPS 上以一般管理帳號執行，原始碼目錄以下假設為 `$HOME/courier-hub`。更新前先依上一節備份資料與私人設定。`git pull` 只更新原始碼；必須重新建置、安裝執行檔並重啟服務，執行中的程式才會套用修改。
+
+**拉取與建置：** 既有服務會繼續運作。以下子 shell 遇到任何錯誤就停止；若工作目錄有未提交的變更或目前分支不是 `main`，先處理後再更新。
 
 ```sh
+(
+set -e
 cd "$HOME/courier-hub"
+[ "$(git branch --show-current)" = main ] || { echo "Switch to main before updating." >&2; exit 1; }
+[ -z "$(git status --porcelain)" ] || { echo "Resolve local changes before updating." >&2; exit 1; }
 git pull --ff-only origin main
+git log -1 --oneline
 cargo test --locked --all-targets
 cargo build --release --locked
+)
+```
+
+**安裝與重啟：** 只有上一段全部成功後才執行。先暫存新執行檔並保留上一版，再停止服務、替換並啟動；期間 API 會短暫中斷。
+
+```sh
+(
+set -e
+cd "$HOME/courier-hub"
 sudo install -o root -g root -m 755 target/release/courier-hub /opt/courier-hub/courier-hub.new
 sudo cp -p /opt/courier-hub/courier-hub /opt/courier-hub/courier-hub.previous
 sudo systemctl stop courier-hub
 sudo mv /opt/courier-hub/courier-hub.new /opt/courier-hub/courier-hub
 sudo systemctl start courier-hub
-curl --fail --silent --show-error http://127.0.0.1:8080/healthz
+)
 ```
+
+保留 `/etc/courier-hub/service.env` 與 `/var/lib/courier-hub`，不要重新複製 `.env.example` 覆蓋私人設定。unit／proxy 範本若有修改，另外審閱後再重新安裝；編輯 unit 後執行 `sudo systemctl daemon-reload`，再重啟服務。只修改 `service.env` 時，執行 `sudo systemctl restart courier-hub` 即可。同一個資料目錄只執行一個服務實例。
+
+**驗證更新：** 確認服務狀態、日誌與健康檢查；兩個 SHA-256 值應相同，表示安裝的執行檔與本次建置一致。
+
+```sh
+sudo systemctl status courier-hub --no-pager
+sudo journalctl -u courier-hub -n 50 --no-pager
+curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:8080/healthz
+sha256sum "$HOME/courier-hub/target/release/courier-hub" /opt/courier-hub/courier-hub
+```
+
+`/healthz` 不測試 SMTP。再依第 6 節透過 API 寄一封測試信，查詢工作直到 `sent`，並確認收件匣或垃圾郵件資料夾實際收到。驗證 `MIME-Version: 1.0` 修改時，查看更新後新寄出的信之原始郵件；Python SMTP 測試只檢查 SMTP 連線與寄送，無法驗證主程式的新執行檔。若服務無法啟動或健康檢查失敗，先查看日誌，再依下一節回復。
+
+### 9. 回復上一版程式
 
 若新執行檔失敗，還原上一版：
 
 ```sh
-sudo systemctl stop courier-hub
+(
+set -e
 sudo cp -p /opt/courier-hub/courier-hub.previous /opt/courier-hub/courier-hub.new
+sudo systemctl stop courier-hub
 sudo mv /opt/courier-hub/courier-hub.new /opt/courier-hub/courier-hub
 sudo systemctl reset-failed courier-hub
 sudo systemctl start courier-hub
+curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:8080/healthz
+)
 ```
 
-更新時保留私人設定與資料目錄。unit／proxy 範本若有修改，另外審閱後再重新安裝；編輯 unit 後執行 `daemon-reload`。修改 `service.env` 需要重啟服務。執行檔回復不會逆轉未來可能的資料庫 schema 變更，因此升級前先備份資料。同一個資料目錄只執行一個服務實例。
+執行檔回復不會逆轉未來可能的資料庫 schema 變更，因此升級前先備份資料，並確認上一版是否相容於更新後的資料庫。
 
 ### 故障排查
 

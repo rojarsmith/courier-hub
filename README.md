@@ -503,7 +503,7 @@ unset courier_api_key
 
 Expect 202 on submission, then poll for `sent`, `failed`, or `unknown`. Preserve `$request_id` and identical content if resubmitting after a connection error. Check SMTP records before retrying an `unknown` job. Avoid verbose curl output with credentials, and do not put the key in a URL.
 
-### 7. Back up, update, and roll back
+### 7. Back up data and private settings
 
 For a consistent offline SQLite backup, stop the service and archive the entire state directory, including any WAL files. The commands cause a brief service interruption; run the final start command even if archiving fails.
 
@@ -518,32 +518,69 @@ sudo systemctl start courier-hub
 
 Keep backups private and encrypted if required; they contain email content. Back up `/etc/courier-hub/service.env` separately to a private secret store. Do not copy a live database file by itself.
 
-Build updates as your administrative account while the existing service keeps running, then replace the executable after a graceful stop:
+### 8. Update the application
+
+Run these commands on the Ubuntu VPS as your administrative account, assuming the source checkout is at `$HOME/courier-hub`. Back up data and private settings as described above before updating. `git pull` only updates the source; rebuild, install the executable, and restart the service to apply changes to the running application.
+
+**Pull and build:** The existing service keeps running. The subshell stops on any error. Resolve uncommitted changes or switch to `main` before updating if either check fails.
 
 ```sh
+(
+set -e
 cd "$HOME/courier-hub"
+[ "$(git branch --show-current)" = main ] || { echo "Switch to main before updating." >&2; exit 1; }
+[ -z "$(git status --porcelain)" ] || { echo "Resolve local changes before updating." >&2; exit 1; }
 git pull --ff-only origin main
+git log -1 --oneline
 cargo test --locked --all-targets
 cargo build --release --locked
+)
+```
+
+**Install and restart:** Run this block only after every command above succeeds. Stage the new executable and save the previous one, then stop the service, replace the executable, and start it. The API will be briefly unavailable.
+
+```sh
+(
+set -e
+cd "$HOME/courier-hub"
 sudo install -o root -g root -m 755 target/release/courier-hub /opt/courier-hub/courier-hub.new
 sudo cp -p /opt/courier-hub/courier-hub /opt/courier-hub/courier-hub.previous
 sudo systemctl stop courier-hub
 sudo mv /opt/courier-hub/courier-hub.new /opt/courier-hub/courier-hub
 sudo systemctl start courier-hub
-curl --fail --silent --show-error http://127.0.0.1:8080/healthz
+)
 ```
+
+Keep `/etc/courier-hub/service.env` and `/var/lib/courier-hub`; do not overwrite private settings by copying `.env.example` again. Review unit/proxy template changes separately before reinstalling them. After editing a unit, run `sudo systemctl daemon-reload` and restart the service. When only `service.env` changes, run `sudo systemctl restart courier-hub`. Run only one instance against the state directory.
+
+**Verify the update:** Check service status, logs, and health. Both SHA-256 values should match, confirming that the installed executable matches this build.
+
+```sh
+sudo systemctl status courier-hub --no-pager
+sudo journalctl -u courier-hub -n 50 --no-pager
+curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:8080/healthz
+sha256sum "$HOME/courier-hub/target/release/courier-hub" /opt/courier-hub/courier-hub
+```
+
+`/healthz` does not test SMTP. Send another test message through the API using section 6, poll its job until `sent`, and confirm receipt in the inbox or spam folder. To verify the `MIME-Version: 1.0` change, inspect the original headers of a newly sent message after updating. The Python SMTP diagnostic checks SMTP connectivity and delivery; it cannot verify the application's new executable. If startup or health checks fail, inspect the logs and use the rollback procedure below.
+
+### 9. Roll back the application
 
 If the new executable fails, restore the previous one:
 
 ```sh
-sudo systemctl stop courier-hub
+(
+set -e
 sudo cp -p /opt/courier-hub/courier-hub.previous /opt/courier-hub/courier-hub.new
+sudo systemctl stop courier-hub
 sudo mv /opt/courier-hub/courier-hub.new /opt/courier-hub/courier-hub
 sudo systemctl reset-failed courier-hub
 sudo systemctl start courier-hub
+curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:8080/healthz
+)
 ```
 
-Keep private settings and the state directory across releases. Review unit/proxy template changes separately before reinstalling them; after editing a unit, run `daemon-reload`. Changing `service.env` requires a service restart. A binary rollback does not reverse future database schema changes, so keep a state backup before upgrades. Run only one instance against the state directory.
+A binary rollback does not reverse future database schema changes. Keep a state backup before upgrades and check whether the previous version is compatible with the updated database.
 
 ### Troubleshooting
 
