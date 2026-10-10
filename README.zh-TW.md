@@ -163,6 +163,108 @@ SMTP_FROM=notifications@your-domain.example
 
 `starttls` 必須成功升級成 TLS 才會傳送帳密與信件；`implicit` 從連線開始即使用 TLS。兩者都驗證主機名稱與公開 CA 憑證，不支援關閉憑證驗證或明文 SMTP。行為依據 [lettre 官方文件](https://docs.rs/lettre/latest/lettre/transport/smtp/struct.AsyncSmtpTransport.html)。
 
+### Gandi Mail
+
+只有在**信箱由 Gandi Mail 代管**時才使用以下設定。網域在 Gandi 註冊，不代表郵件也由 Gandi 代管。需要已啟用的實際信箱，以完整 email 地址登入，並使用該信箱的密碼，而非 Gandi 帳號密碼或 API key。單純轉寄地址不等於信箱。參考 [Gandi 基本郵件設定](https://docs.gandi.net/zh-hant/gandimail/standard_email_settings/index.html)與[信箱／轉寄 FAQ](https://docs.gandi.net/en/gandimail/faq/general_questions.html)。
+
+```ini
+SMTP_HOST=mail.gandi.net
+SMTP_PORT=465
+SMTP_TLS=implicit
+SMTP_USERNAME=notifications@your-domain.example
+SMTP_PASSWORD="REPLACE_WITH_NEW_MAILBOX_PASSWORD"
+SMTP_FROM="Courier Hub <notifications@your-domain.example>"
+```
+
+也可以保留相同主機與帳密，**同時**修改以下兩項：
+
+```ini
+SMTP_PORT=587
+SMTP_TLS=starttls
+```
+
+| 設定 | 正確搭配／意義 |
+| --- | --- |
+| `mail.gandi.net`、465、`implicit` | 建立連線時立即使用 TLS |
+| `mail.gandi.net`、587、`starttls` | SMTP 必須先升級 TLS，才能驗證帳密 |
+| 465 搭配 `starttls` | 搭配錯誤，可能造成逾時或握手失敗 |
+| `smtpout.secureserver.net` | 是 [GoDaddy SMTP 主機](https://www.godaddy.com/en-in/help/use-imap-settings-to-add-my-professional-email-to-a-client-32204)，不是 Gandi Mail；只有信箱實際由該服務代管時才保留 |
+
+程式依 `SMTP_TLS` 決定加密方式，不會自動修正連接埠與 TLS 模式的搭配。初次測試時，`SMTP_FROM` 使用登入的信箱；支援上面加引號的顯示名稱格式。其餘服務設定可保留 Ubuntu 範本值：`BIND_ADDR=127.0.0.1:8080`、`DATA_DIR=/var/lib/courier-hub`、SMTP 逾時 30 秒、2 個 worker、1000 筆待處理工作、每分鐘 120 次請求、保留 24 小時。`ALLOWED_RECIPIENT_DOMAINS=` 留空代表允許所有收件網域。
+
+#### 在 Ubuntu VPS 單獨檢查 Gandi SMTP
+
+在**實際 VPS** 的互動式 Bash 終端執行，直接測試 Gandi，不經 Courier Hub、Nginx 或 API key。`/healthz` 不會測試 SMTP。需要時先安裝診斷工具：
+
+```sh
+sudo apt install -y openssl ca-certificates python3
+getent ahosts mail.gandi.net
+```
+
+1. **不使用帳密、不寄信，檢查網路與 TLS。** 依準備使用的連接埠執行對應指令：
+
+```sh
+# 465：implicit TLS。
+timeout 15s openssl s_client -connect mail.gandi.net:465 \
+  -servername mail.gandi.net -verify_hostname mail.gandi.net \
+  -verify_return_error -brief < /dev/null
+
+# 587：必須升級 STARTTLS。
+timeout 15s openssl s_client -starttls smtp -connect mail.gandi.net:587 \
+  -servername mail.gandi.net -verify_hostname mail.gandi.net \
+  -verify_return_error -brief < /dev/null
+```
+
+應看到 TLS 連線建立與 `Verification: OK`，且沒有憑證錯誤。這一步驗證 DNS、TCP 連線、TLS、公開 CA 憑證鏈與伺服器主機名稱，**不代表密碼正確或郵件能投遞**。`timeout` 結束碼 124 代表檢查逾時。參考 [OpenSSL s_client 文件](https://docs.openssl.org/3.0/man1/openssl-s_client/)。
+
+2. **檢查帳密登入，再視需要寄一封測試信。** 在專案根目錄執行 [scripts/check_gandi_smtp.py](scripts/check_gandi_smtp.py)。它只使用 Python 標準函式庫；執行時輸入完整信箱地址與密碼，密碼隱藏輸入，帳密不會存檔或放進指令列參數。預設只檢查 TLS 與登入，不寄信；加上 `--send` 才會詢問一個自己控制的收件信箱，並實際寄出一封測試信。
+
+```sh
+# 465：只檢查 TLS 與登入，不寄信。
+python3 scripts/check_gandi_smtp.py
+
+# 587：必須升級 STARTTLS，只檢查登入。
+python3 scripts/check_gandi_smtp.py --tls starttls
+
+# 選用：登入成功後，實際寄出一封測試信。
+python3 scripts/check_gandi_smtp.py --send
+
+# 兩個選項可以合併使用。
+python3 scripts/check_gandi_smtp.py --tls starttls --send
+```
+
+請在互動式終端執行，Windows 將 `python3` 改為 `python`。結束碼 0 代表所選檢查完成，1 代表連線／TLS／SMTP 失敗，2 代表輸入無效或無法安全互動輸入，130 代表取消。不需要第三方套件或 API key。
+
+`Authentication OK (SMTP 235)` 代表這台 VPS 能用輸入的帳密登入 Gandi SMTP。預設 SSL context 會驗證憑證與主機名稱；587 分支強制升級 STARTTLS。腳本不讀取 `service.env`，因此測試成功不代表服務已載入相同設定。SMTP 接受郵件仍不保證進入收件匣。本測試檢查外寄 SMTP，收信使用的 IMAP／POP 設定是另一件事。參考 [Python SMTP 用戶端文件](https://docs.python.org/3/library/smtplib.html)與[預設 TLS context](https://docs.python.org/3/library/ssl.html#ssl.create_default_context)。
+
+| 測試結果 | 下一步檢查 |
+| --- | --- |
+| DNS 查詢失敗 | VPS DNS resolver 與 `mail.gandi.net` 拼字 |
+| 連線拒絕／逾時 | VPS 與供應商防火牆是否允許 outbound 465／587、路由及供應商 SMTP 限制；開放 inbound SMTP 不會解決這個用戶端連線問題 |
+| 憑證錯誤 | 主機名稱、系統時間與 CA 憑證套件；保留憑證驗證 |
+| `SMTPNotSupportedError` | 連接埠與 TLS 模式，以及端點是否宣告支援 STARTTLS 或 AUTH |
+| 登入遭拒，常見 SMTP 535 | 完整信箱地址、信箱密碼、信箱是否啟用，以及 SMTP 協定存取權；webmail 能登入不代表 SMTP 已開啟。查看 [Gandi 協定設定](https://docs.gandi.net/fr/gandimail/operations_courantes/param_webmail.html) |
+| 寄件人／收件人／DATA 遭拒 | 寄件權限、收件地址、供應商政策與配額；常見 SMTP 代碼包含 550、553、554 |
+| SMTP 接受，但收件匣沒有信 | 垃圾信匣、退信、收件端過濾，以及供應商的 SPF／DKIM／DMARC 指引 |
+| 獨立測試成功，但 Courier Hub 失敗 | 比較私人服務設定與已測試的值，重啟服務後提交工作並查詢最終狀態；API 健康不代表 SMTP 健康 |
+| 寄送或 QUIT 時斷線／逾時 | 接受狀態可能不確定；先查收件信箱與供應商紀錄，再決定是否重寄 |
+
+#### 套用已測試的設定與更換已曝光憑證
+
+編輯私人執行設定，然後重啟載入：
+
+```sh
+sudoedit /etc/courier-hub/service.env
+sudo chmod 600 /etc/courier-hub/service.env
+sudo systemctl restart courier-hub
+sudo systemctl status courier-hub --no-pager
+sudo journalctl -u courier-hub -n 50 --no-pager
+```
+
+只修改 `service.env` 不需要 `daemon-reload`，修改 unit 檔才需要。環境檔每行使用 `KEY=value`，註解以 `#` 開頭，不加 `export`、不做 shell 展開，也不要 `source`。需要引號的值請依 [systemd EnvironmentFile 語法](https://github.com/systemd/systemd/blob/v255/man/systemd.exec.xml)處理。README 與公開範本只放佔位值。
+
+若真實 SMTP 密碼或 API key 已貼進聊天、截圖或日誌，請先在 Gandi 更換信箱密碼，並在本機以 `openssl rand -hex 32` 產生新的 API key。將新值填入私人設定檔，同步更新 API 呼叫端並重啟；不要重用或重貼已曝光的值。這些文件範例不代表已驗證實際 Gandi 連線或投遞，需在 VPS 上使用私人帳密執行。
+
 ## API 契約
 
 完整規格見 [docs/openapi.yaml](docs/openapi.yaml)，可匯入支援 OpenAPI 3.0 的工具。
@@ -234,6 +336,7 @@ SMTP_FROM=notifications@your-domain.example
 
 ## 安全與資料隱私
 
+- README 範例一律使用通用佔位值，包括信箱地址、私人網域、repository 擁有者、VPS IP 與帳號名稱。不得收錄真實 API key、密碼、私鑰、私人設定檔內容或含個人資料的診斷輸出；可記錄供應商公開主機名稱與標準服務路徑。
 - API key 必填，使用雜湊及固定時間比較驗證；所有工作提交與查詢都需驗證。
 - 預設只開本機介面。需要讓其他機器連線時，在 HTTPS 反向代理／API gateway 後部署，再依部署環境調整 `BIND_ADDR`。程式本身提供 HTTP，SMTP TLS 不會替 HTTP API 加密。
 - HTTP body、文字內容、收件人數、佇列與寄送併發都有上限；每把 key 也有限流。公開入口另外由 gateway 控制連線與未驗證流量，應用層限流不是 DDoS 防護。
@@ -298,6 +401,8 @@ sudo ufw status
 
 ### 2. 建置 Linux 執行檔
 
+執行 clone 指令前，請在本機將 `YOUR_GITHUB_OWNER` 換成自己的 repository 擁有者。
+
 ```sh
 rustup_script=$(mktemp)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$rustup_script"
@@ -305,12 +410,12 @@ sh "$rustup_script" -y --profile minimal --default-toolchain 1.88.0
 rm -f "$rustup_script"
 . "$HOME/.cargo/env"
 
-git clone https://github.com/rojarsmith/courier-hub.git "$HOME/courier-hub"
+git clone https://github.com/YOUR_GITHUB_OWNER/courier-hub.git "$HOME/courier-hub"
 cd "$HOME/courier-hub"
 cargo build --release --locked
 ```
 
-若 repository 是 private，先在 VPS 設定專用、唯讀的 [GitHub deploy key](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/managing-deploy-keys)，再將 clone URL 改成 `git@github.com:rojarsmith/courier-hub.git`。私鑰放在 checkout 之外。實際執行服務的帳號不需要 GitHub 私鑰或 Rust 編譯器。Rust 安裝方式見 [官方說明](https://rust-lang.org/tools/install/)。
+若 repository 是 private，先在 VPS 設定專用、唯讀的 [GitHub deploy key](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/managing-deploy-keys)，再將 clone URL 改成 `git@github.com:YOUR_GITHUB_OWNER/courier-hub.git`，並在本機替換擁有者佔位值。私鑰放在 checkout 之外。實際執行服務的帳號不需要 GitHub 私鑰或 Rust 編譯器。Rust 安裝方式見 [官方說明](https://rust-lang.org/tools/install/)。
 
 ### 3. 安裝執行檔與私人設定
 
@@ -474,6 +579,8 @@ openssl s_client -starttls smtp -connect smtp.gmail.com:587 -servername smtp.gma
 ```
 
 使用自己的郵件供應商主機名稱替換範例。若使用 465 implicit TLS，移除 `-starttls smtp` 並更換連接埠。網域、憑證、SMTP 帳號與 VPS 防火牆需在實際伺服器驗證；開發環境無法確認你的 VPS 已成功部署。
+
+Gandi Mail 請依前面的[獨立 TLS、登入與寄信測試](#在-ubuntu-vps-單獨檢查-gandi-smtp)逐步排查。
 
 ## 開發與驗證
 

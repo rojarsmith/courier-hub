@@ -163,6 +163,108 @@ Owning a domain does not provide a mail service by itself. Use the SMTP host, au
 
 `starttls` must successfully upgrade to TLS before sending credentials or email. `implicit` uses TLS from the start of the connection. Both validate the hostname and public CA certificate chain. Plaintext SMTP and disabling certificate validation are not supported. See the [lettre documentation](https://docs.rs/lettre/latest/lettre/transport/smtp/struct.AsyncSmtpTransport.html).
 
+### Gandi Mail
+
+Use these settings only when **Gandi Mail hosts the mailbox**. Registering a domain at Gandi does not determine who hosts its email. You need an active mailbox, its full email address as the username, and its mailbox password, rather than your Gandi account password or API key. A forwarding address alone is not a mailbox. See [Gandi's email settings](https://docs.gandi.net/en/gandimail/standard_email_settings/) and [mailbox/forwarding FAQ](https://docs.gandi.net/en/gandimail/faq/general_questions.html).
+
+```ini
+SMTP_HOST=mail.gandi.net
+SMTP_PORT=465
+SMTP_TLS=implicit
+SMTP_USERNAME=notifications@your-domain.example
+SMTP_PASSWORD="REPLACE_WITH_NEW_MAILBOX_PASSWORD"
+SMTP_FROM="Courier Hub <notifications@your-domain.example>"
+```
+
+Alternatively, keep the same host and credentials and change **both** settings:
+
+```ini
+SMTP_PORT=587
+SMTP_TLS=starttls
+```
+
+| Setting | Correct pairing / meaning |
+| --- | --- |
+| `mail.gandi.net`, 465, `implicit` | TLS starts immediately when connecting |
+| `mail.gandi.net`, 587, `starttls` | SMTP must upgrade to TLS before authentication |
+| 465 with `starttls` | Incorrect pairing; can cause a timeout or handshake failure |
+| `smtpout.secureserver.net` | A [GoDaddy SMTP host](https://www.godaddy.com/en-in/help/use-imap-settings-to-add-my-professional-email-to-a-client-32204), not Gandi Mail; retain it only if that service actually hosts your mailbox |
+
+The application selects TLS behavior from `SMTP_TLS`; it does not correct a mismatched port automatically. Use the authenticated mailbox as `SMTP_FROM` for the initial test. `SMTP_FROM` supports the quoted display-name format above. Other service settings can retain the Ubuntu template values: `BIND_ADDR=127.0.0.1:8080`, `DATA_DIR=/var/lib/courier-hub`, SMTP timeout 30 seconds, 2 workers, 1000 pending jobs, 120 requests per minute, and 24-hour retention. An empty `ALLOWED_RECIPIENT_DOMAINS=` permits recipients at any domain.
+
+#### Check Gandi SMTP independently on the Ubuntu VPS
+
+Run these checks in an interactive Bash terminal on the **actual VPS**. They bypass Courier Hub, Nginx, and the API key. `/healthz` does not test SMTP. Install the diagnostic tools if needed:
+
+```sh
+sudo apt install -y openssl ca-certificates python3
+getent ahosts mail.gandi.net
+```
+
+1. **Check network access and TLS without credentials or sending mail.** Run the command for the port you intend to use:
+
+```sh
+# Port 465: implicit TLS.
+timeout 15s openssl s_client -connect mail.gandi.net:465 \
+  -servername mail.gandi.net -verify_hostname mail.gandi.net \
+  -verify_return_error -brief < /dev/null
+
+# Port 587: required STARTTLS.
+timeout 15s openssl s_client -starttls smtp -connect mail.gandi.net:587 \
+  -servername mail.gandi.net -verify_hostname mail.gandi.net \
+  -verify_return_error -brief < /dev/null
+```
+
+Look for an established TLS connection and `Verification: OK`, with no certificate error. This checks DNS, TCP connectivity, TLS, the public CA chain, and the server hostname; it does **not** prove your password works or that a message can be delivered. `timeout` exit code 124 means the check timed out. See [OpenSSL's `s_client` documentation](https://docs.openssl.org/3.0/man1/openssl-s_client/).
+
+2. **Check authentication, then optionally send one test message.** From the project root, run [scripts/check_gandi_smtp.py](scripts/check_gandi_smtp.py). It uses only Python standard-library modules. Enter the full mailbox address and password when prompted; the password is hidden, and credentials are not saved or passed as command arguments. The default checks TLS and authentication without sending mail. `--send` prompts for one recipient you control and sends one real test email.
+
+```sh
+# Port 465: TLS and authentication only; no email sent.
+python3 scripts/check_gandi_smtp.py
+
+# Port 587: required STARTTLS and authentication only.
+python3 scripts/check_gandi_smtp.py --tls starttls
+
+# Optionally send one real test email after successful authentication.
+python3 scripts/check_gandi_smtp.py --send
+
+# Both options can be combined.
+python3 scripts/check_gandi_smtp.py --tls starttls --send
+```
+
+Run it in an interactive terminal (on Windows, use `python` instead of `python3`). Exit code 0 means the selected checks completed, 1 means a connection/TLS/SMTP failure, 2 means invalid input or no secure interactive input, and 130 means cancellation. No third-party packages or API key are needed.
+
+`Authentication OK (SMTP 235)` proves this VPS can authenticate to Gandi SMTP using the entered credentials. The default SSL context verifies certificates and hostnames; STARTTLS is mandatory in the 587 branch. The script does not read `service.env`, so success does not prove the service has loaded the same settings. SMTP acceptance still does not guarantee inbox delivery. This test covers outgoing SMTP; IMAP/POP receiving settings are separate. See [Python's SMTP client documentation](https://docs.python.org/3/library/smtplib.html) and [default TLS context](https://docs.python.org/3/library/ssl.html#ssl.create_default_context).
+
+| Result | What to check next |
+| --- | --- |
+| DNS lookup fails | VPS DNS resolver and the spelling of `mail.gandi.net` |
+| Connection refused / timeout | Outbound 465/587 access in VPS/provider firewalls, routing, and provider SMTP restrictions; opening inbound SMTP ports will not fix this client connection |
+| Certificate error | Hostname, system clock, and installed CA certificates; keep certificate verification enabled |
+| `SMTPNotSupportedError` | Correct port/TLS mode and whether the endpoint advertises STARTTLS or AUTH |
+| Authentication rejected, often SMTP 535 | Full mailbox address, mailbox password, active mailbox, and SMTP protocol access; webmail login alone does not prove SMTP is enabled. Check [Gandi's protocol settings](https://docs.gandi.net/fr/gandimail/operations_courantes/param_webmail.html) |
+| Sender / recipient / DATA rejection | Sender authorization, recipient address, provider policy, and quotas; common SMTP codes include 550, 553, and 554 |
+| SMTP accepted, but no message in the inbox | Spam folder, bounces, recipient filtering, and the provider's SPF/DKIM/DMARC guidance |
+| Direct test succeeds, but Courier Hub fails | Compare the private service settings with the tested values, restart the service, then submit a job and query its terminal status; a healthy API does not establish SMTP health |
+| Disconnect / timeout while sending or during QUIT | Acceptance may be uncertain; check the recipient and provider records before sending again |
+
+#### Apply the tested settings and rotate exposed credentials
+
+Edit the private runtime file, then restart to load it:
+
+```sh
+sudoedit /etc/courier-hub/service.env
+sudo chmod 600 /etc/courier-hub/service.env
+sudo systemctl restart courier-hub
+sudo systemctl status courier-hub --no-pager
+sudo journalctl -u courier-hub -n 50 --no-pager
+```
+
+Changing only `service.env` does not require `daemon-reload`; changing the unit file does. The environment file uses `KEY=value`, with `#` for comments, no `export`, and no shell expansion; do not `source` it. Quote values when needed according to [systemd's EnvironmentFile syntax](https://github.com/systemd/systemd/blob/v255/man/systemd.exec.xml). Never store real credentials in README or the public template.
+
+If a real SMTP password or API key has been pasted into a chat, screenshot, or log, replace the mailbox password at Gandi and generate a fresh API key with `openssl rand -hex 32` locally. Enter the new values in the private file, update API clients with the new key, and restart. Do not reuse or reproduce exposed values. No live Gandi connection or delivery is verified by these documentation examples; run the checks on your VPS with your private credentials.
+
 ## API contract
 
 The full specification is in [docs/openapi.yaml](docs/openapi.yaml) and can be imported into tools supporting OpenAPI 3.0.
@@ -234,6 +336,7 @@ Polling and submissions share the rate budget; `/healthz` is excluded. Restart t
 
 ## Security and privacy
 
+- Keep README examples generic: use placeholders for mailbox addresses, personal domains, repository owners, VPS IPs, and account names. Never include real API keys, passwords, private keys, private configuration dumps, or diagnostic output containing personal data. Public provider hostnames and standard service paths may be documented.
 - The API key is mandatory. Authentication uses a hash and constant-time comparison. All job submissions and status queries require authentication.
 - The default listener is local only. For access from other machines, deploy behind an HTTPS reverse proxy or API gateway and adjust `BIND_ADDR` for your environment. The service itself uses HTTP; SMTP TLS does not encrypt the HTTP API.
 - Request bodies, message text, recipient counts, queue capacity, delivery concurrency, and authenticated request rates are bounded. Use a gateway to control public connections and unauthenticated traffic; application rate limits do not provide DDoS protection.
@@ -298,6 +401,8 @@ If SSH uses a port other than 22, allow that port before enabling the firewall a
 
 ### 2. Build the Linux executable
 
+Replace `YOUR_GITHUB_OWNER` with your repository owner locally before running the clone command.
+
 ```sh
 rustup_script=$(mktemp)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$rustup_script"
@@ -305,12 +410,12 @@ sh "$rustup_script" -y --profile minimal --default-toolchain 1.88.0
 rm -f "$rustup_script"
 . "$HOME/.cargo/env"
 
-git clone https://github.com/rojarsmith/courier-hub.git "$HOME/courier-hub"
+git clone https://github.com/YOUR_GITHUB_OWNER/courier-hub.git "$HOME/courier-hub"
 cd "$HOME/courier-hub"
 cargo build --release --locked
 ```
 
-For a private repository, configure a dedicated read-only [GitHub deploy key](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/managing-deploy-keys) on the VPS and use `git@github.com:rojarsmith/courier-hub.git` as the clone URL. Keep that private key outside the checkout. The runtime service account needs no GitHub key or Rust compiler. The Rust installer is described in the [official installation guide](https://rust-lang.org/tools/install/).
+For a private repository, configure a dedicated read-only [GitHub deploy key](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/managing-deploy-keys) on the VPS and use `git@github.com:YOUR_GITHUB_OWNER/courier-hub.git` as the clone URL, replacing the owner placeholder locally. Keep that private key outside the checkout. The runtime service account needs no GitHub key or Rust compiler. The Rust installer is described in the [official installation guide](https://rust-lang.org/tools/install/).
 
 ### 3. Install the executable and private settings
 
@@ -474,6 +579,8 @@ openssl s_client -starttls smtp -connect smtp.gmail.com:587 -servername smtp.gma
 ```
 
 Use your provider's hostname instead. For implicit TLS on port 465, omit `-starttls smtp` and change the port. Domain, certificate, SMTP account, and VPS firewall checks must be performed on the actual server; the development environment does not verify your VPS deployment.
+
+For Gandi Mail, follow the [independent TLS, authentication, and delivery checks](#check-gandi-smtp-independently-on-the-ubuntu-vps) above.
 
 ## Development and verification
 
