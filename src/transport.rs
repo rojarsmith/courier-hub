@@ -1,7 +1,10 @@
 use async_trait::async_trait;
 use lettre::{
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
-    message::{Mailbox, header::ContentType},
+    message::{
+        Mailbox,
+        header::{ContentType, MIME_VERSION_1_0},
+    },
     transport::smtp::authentication::Credentials,
 };
 
@@ -72,6 +75,7 @@ impl SmtpTransport {
             .from(self.from.clone())
             .subject(&email.subject)
             .message_id(Some(format!("<{job_id}@{}>", self.from.email.domain())))
+            .header(MIME_VERSION_1_0)
             .header(ContentType::TEXT_PLAIN);
         for to in &email.to {
             builder = builder.to(Mailbox::new(
@@ -220,6 +224,14 @@ mod tests {
                 .unwrap()
                 .unwrap();
             if !reject {
+                let (headers, _) = message.split_once("\r\n\r\n").unwrap();
+                assert_eq!(
+                    headers
+                        .lines()
+                        .filter(|line| line.starts_with("MIME-Version:"))
+                        .collect::<Vec<_>>(),
+                    vec!["MIME-Version: 1.0"]
+                );
                 assert!(message.contains("From: sender@example.com"));
                 assert!(message.contains("To: recipient@example.com"));
                 assert!(message.contains("Message-ID: <test-job@example.com>"));
