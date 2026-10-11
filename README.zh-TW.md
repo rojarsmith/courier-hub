@@ -2,7 +2,7 @@
 
 [English](README.md) | **繁體中文**
 
-用 Rust、Axum、Tokio 實作的 REST API 非同步轉送服務，目前支援透過第三方 SMTP 寄送純文字 email。可使用 Gmail 或自有網域信箱的 SMTP 主機；本服務不自行架設郵件伺服器，也不接收 SMTP 來信。
+用 Rust、Axum、Tokio 實作的 REST API 非同步轉送服務，支援透過第三方 SMTP 寄送純文字／HTML email、檔案附件與 CID 內嵌圖片。可使用 Gmail 或自有網域信箱的 SMTP 主機；本服務不自行架設郵件伺服器，也不接收 SMTP 來信。
 
 ## 服務流程
 
@@ -266,15 +266,75 @@ sudo journalctl -u courier-hub -n 50 --no-pager
 | POST | `/v1/emails` | 提交 email，成功回傳 202、工作 ID 與 Location | Bearer API key |
 | GET | `/v1/jobs/{id}` | 查詢工作狀態 | Bearer API key |
 
-提交 JSON 只允許 `to`、`subject`、`text`，不接受多餘欄位。目前不提供附件、HTML、CC/BCC 或接收郵件功能。
+提交 JSON 必須包含 `to`、`subject`、`text`，可選擇加入 `html` 與 `attachments`。不接受多餘欄位，附件物件也適用。既有純文字請求仍可使用；目前不提供 CC/BCC 或接收郵件功能。
 
 | 欄位 | 限制 |
 | --- | --- |
 | `to` | 1～10 個裸 email 地址，每個最多 254 bytes；不接受顯示名稱 |
 | `subject` | 非空白、最多 998 bytes；拒絕控制字元（含 CR/LF） |
-| `text` | 非空白、最多 48 KiB；拒絕 NUL |
-| HTTP JSON | 最多 64 KiB，含 JSON 編碼開銷 |
+| `text` | 必填的純文字備援正文；非空白、最多 48 KiB；拒絕 NUL |
+| `html` | 可選的 HTML 正文；提供時須非空白、最多 48 KiB；拒絕 NUL |
+| `attachments` | 可選陣列，最多 10 個檔案（含內嵌圖片）；解碼後檔案總量最多 5 MiB |
+| HTTP JSON | 最多 8 MiB，含 JSON 與 Base64 編碼開銷 |
 | `Idempotency-Key` | 可選，1～128 ASCII 字元；只允許英數及 `-_.:` |
+
+### HTML、附件與內嵌圖片
+
+`text` 保留作為不顯示 HTML 的用戶端之備援正文，另加 `html` 提供排版。每個附件包含 `filename`、`content_type`、`content_base64`。一般附件省略 `content_id`；內嵌圖片則提供此值，並在 HTML 用 `<img src="cid:logo">` 引用。ID 在同一封信中必須唯一，由 1～128 個 ASCII 英數或 `@._-` 組成，不包含尖括號。內嵌類型支援 `image/png`、`image/jpeg`、`image/gif`、`image/webp`，實際顯示仍取決於收件端的郵件軟體。
+
+檔名須非空白、最多 255 UTF-8 bytes，不含控制字元或路徑分隔符號，且不可為 `.` 或 `..`。媒體類型為 `type/subtype`，最多 127 ASCII bytes，不接受 header 參數、萬用字元或 `multipart/*`／`message/*` 容器類型；例如 `.eml` 原始檔附件可使用 `application/octet-stream`。檔案採標準 Base64，保留必要的 `=` padding，不含空白或 `data:` 前綴；內容應符合宣告的媒體類型。服務不偵測檔案格式、不掃描附件、不清理 HTML，也不從檔案路徑或 URL 取檔。HTML 中的外部圖片 URL 由收件端自行處理。
+
+HTML 加一般附件的完整請求範例（檔案解碼後為 `Hello from Courier Hub.`）：
+
+```json
+{
+  "to": ["recipient@example.com"],
+  "subject": "HTML and attachment example",
+  "text": "Hello! Please see the attached note.",
+  "html": "<p><strong>Hello!</strong> Please see the attached note.</p>",
+  "attachments": [
+    {
+      "filename": "note.txt",
+      "content_type": "text/plain",
+      "content_base64": "SGVsbG8gZnJvbSBDb3VyaWVyIEh1Yi4="
+    }
+  ]
+}
+```
+
+寄送 PDF 與本機 PNG 內嵌圖片時，可在 PowerShell 準備下方 body，再沿用快速開始的含驗證 `Invoke-RestMethod` 範例送出。替換為自己的檔案路徑，讀檔在客戶端完成：
+
+```powershell
+$pdfPath = (Resolve-Path -LiteralPath '.\report.pdf').Path
+$imagePath = (Resolve-Path -LiteralPath '.\logo.png').Path
+$body = @{
+    to = @('recipient@example.com')
+    subject = 'Report with inline logo'
+    text = 'Please see the attached report.'
+    html = '<p>Please see the attached report.</p><img src="cid:logo" alt="Logo">'
+    attachments = @(
+        @{
+            filename = 'report.pdf'
+            content_type = 'application/pdf'
+            content_base64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($pdfPath))
+        },
+        @{
+            filename = 'logo.png'
+            content_type = 'image/png'
+            content_base64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($imagePath))
+            content_id = 'logo'
+        }
+    )
+} | ConvertTo-Json -Depth 5
+```
+
+SMTP 信件以 MIME alternative 提供純文字／HTML，以 related 將 CID 圖片附屬於 HTML，再以 mixed 包含一般附件，使用 [lettre MIME builder](https://docs.rs/lettre/0.11.23/lettre/message/index.html) 建構。檔案在 SMTP 傳輸時採 Base64。`html: null` 與省略／空的 `attachments` 保持既有純文字行為。去重比較所有解析後欄位，包含 HTML、標準 Base64 檔案內容、檔名與類型、ID 及陣列順序；省略／null 的 `html` 與省略／空的 `attachments` 視為相同。
+
+等待寄送的檔案隨工作持久儲存，工作到達終止狀態時從 active payload 移除，狀態 API 不回傳檔案。Base64 約增加三分之一資料量，解碼與 MIME 建構也會增加暫時 RAM 用量。佇列限制計算工作數，不是 bytes；1000 個最大尺寸工作可能占用數 GiB 磁碟。依 VPS 容量設定 `MAX_PENDING_JOBS`、`WORKER_CONCURRENCY` 與請求流量，並以代表性的附件負載量測。
+
+既有 VPS 部署需重新建置／安裝／重啟程式，並用 `sudoedit /etc/nginx/sites-available/courier-hub` 將已安裝代理檔的設定改為 `client_max_body_size 8m;`，再執行 `sudo nginx -t` 與 `sudo systemctl reload nginx`。只更新 repository 不會修改已安裝的代理設定。既有純文字佇列與去重 key 保持相容；舊執行檔無法處理含新欄位的待寄工作，回復純文字舊版前須先讓這些工作完成。
+
+### 工作狀態與去重
 
 時間欄位 `created_at`／`updated_at` 為 UTC Unix 秒。工作 JSON：
 
@@ -334,7 +394,7 @@ sudo journalctl -u courier-hub -n 50 --no-pager
 - 不開放 CORS；瀏覽器若需要跨來源呼叫，應另建經過驗證的後端代理。不要把 API key 放進公開前端。
 - API 不接受 SMTP host、帳密、寄件人或任意轉送 URL；避免讓呼叫端決定內部網路目的地。需要限制可寄送對象時設定 `ALLOWED_RECIPIENT_DOMAINS`。
 - 應用程式只記錄工作 ID、狀態與通用錯誤，不記錄金鑰、SMTP 帳密、地址、主旨、內文或供應商原始錯誤。
-- SQLite 必須持久儲存尚未寄送的地址、主旨及內文，目前為明文磁碟資料。終止狀態會將 payload 設成 NULL；這不是實體安全抹除，WAL、磁碟殘留及備份仍可能保存舊資料。需要磁碟／備份加密時由部署環境提供。
+- SQLite 持久儲存尚未寄送的地址、主旨、純文字／HTML 內文及 Base64 檔案內容，目前未加密。終止狀態會將 payload 設成 NULL；這不是實體安全抹除，WAL、磁碟殘留及備份仍可能保存舊資料。需要磁碟／備份加密時由部署環境提供。
 - Unix 的資料庫和 lock 檔限制成 0600；Windows 使用資料夾既有 ACL，部署時僅給服務帳號必要權限。`.env`、資料目錄和備份都應限制檔案權限。
 - `.gitignore` 已排除 `.env`、`.env.*`（保留無秘密的 `.env.example`）、`data/`、SQLite/WAL、金鑰憑證與 log。自訂資料路徑放在專案外，或另外加入 ignore。
 - `.gitignore` 不會移除已追蹤的秘密，也不會阻止 `git add -f`。這是新專案，沒有納入真實帳密；若未來秘密被提交，先撤銷／輪替，再處理 Git 歷史。
@@ -492,7 +552,7 @@ systemctl list-timers --all
 
 確認排程中有 Certbot 的自動續期 timer。deploy hook 會在憑證續期後檢查並 reload Nginx，dry run 也會測試該 hook。續期時仍需保留 HTTP ACME 路徑與 80 連接埠；參考 [Certbot 續期文件](https://eff-certbot.readthedocs.io/en/stable/using.html#renewing-certificates)。
 
-HTTPS 範本會轉送驗證 header、將 request body 限制為 64 KiB、關閉 upstream 重試，並加入每 IP 每秒 10 個請求、突發 20 個的入口限流。多個客戶端共用 NAT IP 時請依流量調整；應用程式的 API key 流量上限仍然生效。設定依據 [Nginx 反向代理](https://nginx.org/en/docs/http/ngx_http_proxy_module.html) 與 [限流](https://nginx.org/en/docs/http/ngx_http_limit_req_module.html) 文件。呼叫 API 時直接使用 `https://` URL；轉址無法保護已經透過 HTTP 傳出的金鑰。
+HTTPS 範本會轉送驗證 header、將 request body 限制為 8 MiB、關閉 upstream 重試，並加入每 IP 每秒 10 個請求、突發 20 個的入口限流。多個客戶端共用 NAT IP 時請依流量調整；應用程式的 API key 流量上限仍然生效。設定依據 [Nginx 反向代理](https://nginx.org/en/docs/http/ngx_http_proxy_module.html) 與 [限流](https://nginx.org/en/docs/http/ngx_http_limit_req_module.html) 文件。呼叫 API 時直接使用 `https://` URL；轉址無法保護已經透過 HTTP 傳出的金鑰。
 
 ### 6. 驗證權限與實際寄送
 

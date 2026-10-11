@@ -12,10 +12,11 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use courier_hub::{
     api::{AppState, router},
     config::Config,
-    model::{Email, Job},
+    model::{Email, EmailAttachment, Job, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS},
     store::{EnqueueResult, Store},
     transport::{DeliveryError, DeliveryTransport},
     worker,
@@ -32,6 +33,8 @@ fn email() -> Email {
         to: vec!["receiver@example.com".into()],
         subject: "Hello Rust".into(),
         text: "Private test body".into(),
+        html: None,
+        attachments: vec![],
     }
 }
 
@@ -80,6 +83,232 @@ async fn enqueue(store: &Store, key: Option<&str>) -> Job {
         EnqueueResult::Accepted(job) => job,
         _ => panic!("expected accepted job"),
     }
+}
+
+fn rich_email() -> Email {
+    let mut email = email();
+    email.html = Some("<p>Private HTML body</p><img src=\"cid:logo\">".into());
+    email.attachments = vec![
+        EmailAttachment {
+            filename: "report.txt".into(),
+            content_type: "text/plain".into(),
+            content_base64: STANDARD.encode(b"Private attachment content"),
+            content_id: None,
+        },
+        EmailAttachment {
+            filename: "logo.png".into(),
+            content_type: "image/png".into(),
+            content_base64: STANDARD.encode(b"\x89PNG\r\n\x1a\n"),
+            content_id: Some("logo".into()),
+        },
+    ];
+    email
+}
+
+#[tokio::test]
+async fn rich_email_survives_restart_and_idempotency_covers_all_fields() {
+    let (dir, store, app) = fixture(100, 100, vec![]).await;
+    let original = rich_email();
+    let (status, first) = request(
+        &app,
+        "POST",
+        "/v1/emails",
+        Some(KEY),
+        Some(json!(original)),
+        Some("rich-1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let (status, replay) = request(
+        &app,
+        "POST",
+        "/v1/emails",
+        Some(KEY),
+        Some(json!(original)),
+        Some("rich-1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(first["id"], replay["id"]);
+    for change in 0..5 {
+        let mut changed = original.clone();
+        match change {
+            0 => changed.html = Some("<p>Changed HTML</p>".into()),
+            1 => changed.attachments[0].content_base64 = STANDARD.encode(b"changed content"),
+            2 => changed.attachments[0].filename = "different.txt".into(),
+            3 => changed.attachments[0].content_type = "application/octet-stream".into(),
+            _ => changed.attachments[1].content_id = Some("different-logo".into()),
+        }
+        assert_eq!(
+            request(
+                &app,
+                "POST",
+                "/v1/emails",
+                Some(KEY),
+                Some(json!(changed)),
+                Some("rich-1")
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+    }
+    let uri = format!("/v1/jobs/{}", first["id"].as_str().unwrap());
+    let (_, status) = request(&app, "GET", &uri, Some(KEY), None, None).await;
+    for field in ["html", "attachments", "content_base64", "text", "payload"] {
+        assert!(status.get(field).is_none());
+    }
+    drop(app);
+    store.close().await;
+    drop(store);
+    let reopened = Store::open(dir.path()).await.unwrap();
+    let queued = reopened.claim().await.unwrap().unwrap();
+    let restored: Email = serde_json::from_str(&queued.payload).unwrap();
+    assert_eq!(json!(restored), json!(original));
+    assert_eq!(queued.id, first["id"].as_str().unwrap());
+    reopened.close().await;
+}
+
+#[test]
+fn legacy_plain_text_payload_and_fingerprint_remain_compatible() {
+    let old =
+        r#"{"to":["receiver@example.com"],"subject":"Hello Rust","text":"Private test body"}"#;
+    let restored: Email = serde_json::from_str(old).unwrap();
+    assert!(restored.html.is_none());
+    assert!(restored.attachments.is_empty());
+    assert_eq!(serde_json::to_string(&restored).unwrap(), old);
+    let explicit: Email = serde_json::from_value(json!({
+        "to": ["receiver@example.com"], "subject": "Hello Rust", "text": "Private test body",
+        "html": null, "attachments": []
+    }))
+    .unwrap();
+    assert_eq!(serde_json::to_string(&explicit).unwrap(), old);
+}
+
+#[tokio::test]
+async fn attachment_validation_rejects_invalid_metadata_content_and_inline_usage() {
+    let (_dir, store, app) = fixture(100, 100, vec![]).await;
+    let valid = json!(rich_email());
+    for (field, value) in [
+        ("filename", "private\r\nBcc: bad@example.com"),
+        ("filename", "../private.png"),
+        ("filename", "C:\\private.png"),
+        ("filename", ".."),
+        ("content_type", "image/png\r\nX-Injected: private"),
+        ("content_type", "image/png; name=private"),
+        ("content_type", "invalid"),
+        ("content_type", "text/html"),
+        ("content_id", "private\r\nX-Injected: true"),
+        ("content_id", "<private>"),
+        ("content_id", ""),
+        ("content_base64", "private-invalid-base64!"),
+        ("content_base64", "Zg"),
+        ("content_base64", "Zg==\n"),
+        ("content_base64", "Zh=="),
+    ] {
+        let mut invalid = valid.clone();
+        invalid["attachments"][1][field] = json!(value);
+        let (status, error) =
+            request(&app, "POST", "/v1/emails", Some(KEY), Some(invalid), None).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{field}");
+        assert!(!error.to_string().contains("private"));
+    }
+    for content_type in ["multipart/mixed", "message/rfc822", "*/*", "image/*"] {
+        let mut invalid = valid.clone();
+        invalid["attachments"][0]["content_type"] = json!(content_type);
+        assert_eq!(
+            request(&app, "POST", "/v1/emails", Some(KEY), Some(invalid), None)
+                .await
+                .0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+    let mut invalid = valid.clone();
+    invalid.as_object_mut().unwrap().remove("html");
+    assert_eq!(
+        request(&app, "POST", "/v1/emails", Some(KEY), Some(invalid), None)
+            .await
+            .0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let mut invalid = valid.clone();
+    invalid["attachments"][0]["content_id"] = json!("logo");
+    invalid["attachments"][0]["content_type"] = json!("image/png");
+    assert_eq!(
+        request(&app, "POST", "/v1/emails", Some(KEY), Some(invalid), None)
+            .await
+            .0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let mut invalid = valid.clone();
+    invalid["attachments"][0]["path"] = json!("private-file-path");
+    assert_eq!(
+        request(&app, "POST", "/v1/emails", Some(KEY), Some(invalid), None)
+            .await
+            .0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    for html in [
+        "".to_owned(),
+        " ".to_owned(),
+        "\0private".to_owned(),
+        "x".repeat(48 * 1024 + 1),
+    ] {
+        let mut invalid = valid.clone();
+        invalid["html"] = json!(html);
+        assert_eq!(
+            request(&app, "POST", "/v1/emails", Some(KEY), Some(invalid), None)
+                .await
+                .0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+    assert!(store.claim().await.unwrap().is_none());
+    store.close().await;
+}
+
+#[tokio::test]
+async fn attachment_budget_accepts_boundary_and_rejects_total_and_count_overflow() {
+    let (_dir, store, app) = fixture(100, 100, vec![]).await;
+    let mut rich = rich_email();
+    rich.attachments.truncate(1);
+    rich.attachments[0].content_base64 = STANDARD.encode(vec![0; MAX_ATTACHMENT_BYTES]);
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            "/v1/emails",
+            Some(KEY),
+            Some(json!(rich)),
+            None
+        )
+        .await
+        .0,
+        StatusCode::ACCEPTED
+    );
+    rich.attachments.push(rich_email().attachments[0].clone());
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            "/v1/emails",
+            Some(KEY),
+            Some(json!(rich)),
+            None
+        )
+        .await
+        .0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    rich.attachments.truncate(1);
+    rich.attachments[0].content_base64 = STANDARD.encode(vec![0; MAX_ATTACHMENT_BYTES + 1]);
+    assert!(rich.validate(&[]).is_err());
+    rich = rich_email();
+    rich.attachments = vec![rich.attachments[0].clone(); MAX_ATTACHMENTS];
+    assert!(rich.validate(&[]).is_ok());
+    rich.attachments.push(rich.attachments[0].clone());
+    assert!(rich.validate(&[]).is_err());
+    store.close().await;
 }
 
 #[tokio::test]
@@ -276,7 +505,7 @@ async fn rejects_invalid_headers_fields_and_large_body() {
         StatusCode::BAD_REQUEST
     );
     let mut huge = email();
-    huge.text = "x".repeat(70 * 1024);
+    huge.text = "x".repeat(courier_hub::model::MAX_REQUEST_BYTES);
     assert_eq!(
         request(
             &app,
@@ -460,7 +689,10 @@ async fn worker_finishes_without_exposing_payload_and_does_not_retry() {
         (Err(DeliveryError::Uncertain), "unknown"),
     ] {
         let (dir, store, _app) = fixture(100, 100, vec![]).await;
-        let job = enqueue(&store, None).await;
+        let job = match store.enqueue(&rich_email(), None, 100).await.unwrap() {
+            EnqueueResult::Accepted(job) => job,
+            _ => panic!("expected rich email admission"),
+        };
         let fake = Arc::new(FakeTransport {
             calls: AtomicUsize::new(0),
             result,

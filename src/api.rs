@@ -17,7 +17,7 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::{
-    model::Email,
+    model::{Email, MAX_REQUEST_BYTES},
     store::{EnqueueResult, Store},
 };
 
@@ -74,7 +74,7 @@ pub fn router(state: AppState) -> Router {
                 "method not allowed",
             )
         })
-        .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(middleware::from_fn(response_controls))
         .with_state(state)
 }
@@ -177,7 +177,7 @@ async fn submit_email(
             return error(
                 rejection.status(),
                 "invalid_request",
-                "expected valid JSON email within 64 KiB; fields: to, subject, text",
+                "expected valid JSON email within 8 MiB; fields: to, subject, text, html, attachments",
             );
         }
     };

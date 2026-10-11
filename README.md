@@ -2,7 +2,7 @@
 
 **English** | [繁體中文](README.zh-TW.md)
 
-An asynchronous REST API relay built with Rust, Axum, and Tokio. The first version sends plain-text email through a third-party SMTP server, such as Gmail or the provider hosting your domain's mailboxes. It does not run a mail server or receive incoming SMTP mail.
+An asynchronous REST API relay built with Rust, Axum, and Tokio. It sends plain-text or HTML email, file attachments, and CID inline images through a third-party SMTP server, such as Gmail or the provider hosting your domain's mailboxes. It does not run a mail server or receive incoming SMTP mail.
 
 ## How it works
 
@@ -266,15 +266,75 @@ The full specification is in [docs/openapi.yaml](docs/openapi.yaml) and can be i
 | POST | `/v1/emails` | Submit email; return 202, a job ID, and Location | Bearer API key |
 | GET | `/v1/jobs/{id}` | Query delivery status | Bearer API key |
 
-Submission JSON permits only `to`, `subject`, and `text`. Extra fields are rejected. Attachments, HTML, CC/BCC, and incoming mail are not supported in this version.
+Submission JSON requires `to`, `subject`, and `text`, and optionally accepts `html` and `attachments`. Extra fields are rejected, including inside attachment objects. Existing plain-text requests still work. CC/BCC and incoming mail are not supported.
 
 | Field | Limit |
 | --- | --- |
 | `to` | 1–10 bare email addresses, at most 254 bytes each; no display names |
 | `subject` | Nonblank, at most 998 bytes; no control characters, including CR/LF |
-| `text` | Nonblank, at most 48 KiB; no NUL characters |
-| HTTP JSON | At most 64 KiB, including JSON encoding overhead |
+| `text` | Required plain-text fallback; nonblank, at most 48 KiB; no NUL characters |
+| `html` | Optional HTML alternative; if present, nonblank, at most 48 KiB; no NUL characters |
+| `attachments` | Optional array, at most 10 files including inline images; decoded bytes total at most 5 MiB |
+| HTTP JSON | At most 8 MiB, including JSON and Base64 encoding overhead |
 | `Idempotency-Key` | Optional; 1–128 ASCII characters, limited to letters, digits, and `-_.:` |
+
+### HTML, attachments, and inline images
+
+Keep `text` as the fallback for clients that do not render HTML. Add `html` for formatting. Each attachment contains `filename`, `content_type`, and `content_base64`. Omit `content_id` for a regular attachment; supply it for an inline image and reference it in HTML as `<img src="cid:logo">`. IDs must be unique per email and contain 1–128 ASCII letters, digits, or `@._-`, without angle brackets. Inline types are `image/png`, `image/jpeg`, `image/gif`, and `image/webp`; actual display depends on the recipient's mail client.
+
+Filenames must be nonblank, at most 255 UTF-8 bytes, without control characters or path separators, and cannot be `.` or `..`. Media types must be `type/subtype`, at most 127 ASCII bytes, without header parameters, wildcards, or `multipart/*` / `message/*` containers. Use `application/octet-stream` for a raw file such as an `.eml` attachment. Use standard Base64 with required `=` padding, no whitespace or `data:` prefix. File bytes and media type must match; the relay does not sniff files, scan attachments, sanitize HTML, or fetch files from paths/URLs. Remote image URLs in HTML are handled by the receiving client.
+
+A complete HTML + regular attachment request (the file decodes to `Hello from Courier Hub.`):
+
+```json
+{
+  "to": ["recipient@example.com"],
+  "subject": "HTML and attachment example",
+  "text": "Hello! Please see the attached note.",
+  "html": "<p><strong>Hello!</strong> Please see the attached note.</p>",
+  "attachments": [
+    {
+      "filename": "note.txt",
+      "content_type": "text/plain",
+      "content_base64": "SGVsbG8gZnJvbSBDb3VyaWVyIEh1Yi4="
+    }
+  ]
+}
+```
+
+To submit a PDF and a local PNG inline image, prepare this body in PowerShell and send it using the authenticated `Invoke-RestMethod` example in Quick start. Replace the paths with your own files; file reads happen on the client:
+
+```powershell
+$pdfPath = (Resolve-Path -LiteralPath '.\report.pdf').Path
+$imagePath = (Resolve-Path -LiteralPath '.\logo.png').Path
+$body = @{
+    to = @('recipient@example.com')
+    subject = 'Report with inline logo'
+    text = 'Please see the attached report.'
+    html = '<p>Please see the attached report.</p><img src="cid:logo" alt="Logo">'
+    attachments = @(
+        @{
+            filename = 'report.pdf'
+            content_type = 'application/pdf'
+            content_base64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($pdfPath))
+        },
+        @{
+            filename = 'logo.png'
+            content_type = 'image/png'
+            content_base64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($imagePath))
+            content_id = 'logo'
+        }
+    )
+} | ConvertTo-Json -Depth 5
+```
+
+The SMTP message uses MIME alternatives for text/HTML, a related HTML part for CID images, and a mixed envelope for ordinary attachments, using [lettre's MIME builder](https://docs.rs/lettre/0.11.23/lettre/message/index.html). File bytes are Base64-encoded on the SMTP wire. `html: null` and an omitted/empty `attachments` array keep the existing plain-text behavior. Idempotency compares all parsed fields, including HTML, canonical Base64 content, metadata, IDs, and array order; omitted/null `html` and omitted/empty `attachments` are equivalent.
+
+File content is persisted in pending jobs and removed from the active payload when a job reaches a terminal status; status queries never return it. Base64 expands file data by about one third, and decoding/MIME construction adds transient RAM usage. The queue limit counts jobs, not bytes: 1000 maximum-size jobs can consume several GiB of disk. Size `MAX_PENDING_JOBS`, `WORKER_CONCURRENCY`, and request traffic for your VPS, and measure under representative attachment workloads.
+
+For an existing VPS deployment, rebuild/install/restart the application and edit the installed proxy file with `sudoedit /etc/nginx/sites-available/courier-hub` to set `client_max_body_size 8m;`, then run `sudo nginx -t` and `sudo systemctl reload nginx`. Updating the repository alone does not change the installed proxy file. Old queued plain-text jobs and their idempotency keys remain compatible; older executables cannot process queued jobs containing the new fields, so let those jobs finish before rolling back to a plain-text-only version.
+
+### Job status and idempotency
 
 `created_at` and `updated_at` are UTC Unix seconds. Example job response:
 
@@ -334,7 +394,7 @@ Polling and submissions share the rate budget; `/healthz` is excluded. Restart t
 - CORS is not enabled. Browser clients needing cross-origin access should use an authenticated backend proxy. Do not expose the API key in a public frontend.
 - The API does not accept SMTP hosts, credentials, sender addresses, or arbitrary relay URLs. Callers cannot choose internal network destinations. Set `ALLOWED_RECIPIENT_DOMAINS` to restrict recipients.
 - Application logs include only job IDs, statuses, and generic errors. They do not include API keys, SMTP credentials, addresses, subjects, message bodies, or raw provider errors.
-- SQLite persists recipients, subjects, and bodies for pending jobs as plaintext on disk. Terminal jobs have their payload set to NULL. This is not secure physical erasure: WAL files, disk remnants, and backups may retain earlier data. Provide disk and backup encryption through your deployment environment if required.
+- SQLite persists recipients, subjects, text/HTML, and Base64 file content for pending jobs without encryption. Terminal jobs have their payload set to NULL. This is not secure physical erasure: WAL files, disk remnants, and backups may retain earlier data. Provide disk and backup encryption through your deployment environment if required.
 - Database and lock files use mode 0600 on Unix. Windows inherits the data directory's ACL; give only the service account the necessary access. Restrict access to `.env`, data directories, and backups.
 - `.gitignore` excludes `.env`, `.env.*` except the secret-free `.env.example`, `data/`, SQLite/WAL files, private key/certificate files, and logs. Put custom data directories outside the repository or add them to your ignore rules.
 - `.gitignore` does not remove already tracked secrets or prevent `git add -f`. No real credentials were added to this new project. If a secret is committed later, revoke or rotate it first, then address Git history.
@@ -492,7 +552,7 @@ systemctl list-timers --all
 
 Confirm the Certbot renewal timer is present. The deploy hook checks and reloads Nginx after certificate renewal; the dry run also exercises that hook. Keep the HTTP ACME path and port 80 available for renewals. See [Certbot's renewal documentation](https://eff-certbot.readthedocs.io/en/stable/using.html#renewing-certificates).
 
-The HTTPS template forwards authentication headers, caps bodies at 64 KiB, disables upstream retries, and adds a per-IP edge limit of 10 requests/second with a burst of 20. Tune that edge limit for clients sharing a NAT address; the application's API-key rate budget still applies. These directives follow the [Nginx proxy](https://nginx.org/en/docs/http/ngx_http_proxy_module.html) and [rate-limit](https://nginx.org/en/docs/http/ngx_http_limit_req_module.html) documentation. Always call the API with an `https://` URL directly; a redirect cannot protect a key already sent over HTTP.
+The HTTPS template forwards authentication headers, caps bodies at 8 MiB, disables upstream retries, and adds a per-IP edge limit of 10 requests/second with a burst of 20. Tune that edge limit for clients sharing a NAT address; the application's API-key rate budget still applies. These directives follow the [Nginx proxy](https://nginx.org/en/docs/http/ngx_http_proxy_module.html) and [rate-limit](https://nginx.org/en/docs/http/ngx_http_limit_req_module.html) documentation. Always call the API with an `https://` URL directly; a redirect cannot protect a key already sent over HTTP.
 
 ### 6. Verify authenticated delivery
 

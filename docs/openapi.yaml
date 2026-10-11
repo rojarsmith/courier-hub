@@ -3,7 +3,8 @@ info:
   title: Courier Hub
   version: 0.1.0
   description: >-
-    Authenticated asynchronous plain-text email relay. Acceptance into the durable
+    Authenticated asynchronous email relay supporting plain text, HTML, attachments,
+    and CID inline images. Acceptance into the durable
     queue does not imply SMTP acceptance or inbox delivery. One configured SMTP
     account and one shared API key per process.
 servers:
@@ -33,10 +34,14 @@ paths:
   /v1/emails:
     post:
       operationId: submitEmail
-      summary: Submit a plain-text email for asynchronous delivery
+      summary: Submit an email for asynchronous delivery
       description: >-
-        Request body is limited to 64 KiB including JSON encoding. Recipients,
-        subject and text have byte limits enforced by the service. Sender and SMTP
+        Request body is limited to 8 MiB including JSON and Base64 encoding.
+        Text is required as a plain-text fallback; optional HTML is sent as an
+        alternative. At most 10 attachments including CID images, with at most
+        5 MiB decoded bytes in total. Files are supplied as standard Base64, never
+        as paths or download URLs. HTML and each file's declared media type are
+        relayed without sanitization or content sniffing. Sender and SMTP
         credentials come exclusively from server configuration.
       parameters:
         - in: header
@@ -83,7 +88,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '413':
-          description: JSON exceeds 64 KiB
+          description: JSON exceeds 8 MiB
           content:
             application/json:
               schema:
@@ -165,11 +170,51 @@ components:
           description: Nonblank, at most 998 UTF-8 bytes, no control characters
         text:
           type: string
-          description: Nonblank, at most 49152 UTF-8 bytes, no NUL characters
+          description: Required plain-text fallback, nonblank, at most 49152 UTF-8 bytes, no NUL characters
+        html:
+          type: string
+          nullable: true
+          description: Optional HTML alternative; when present, nonblank, at most 49152 UTF-8 bytes, no NUL characters
+        attachments:
+          type: array
+          maxItems: 10
+          default: []
+          description: Regular files and CID inline images; combined decoded size at most 5242880 bytes
+          items:
+            $ref: '#/components/schemas/EmailAttachment'
       example:
         to: [recipient@example.com]
         subject: Hello
         text: Hello from Courier Hub
+    EmailAttachment:
+      type: object
+      additionalProperties: false
+      required: [filename, content_type, content_base64]
+      properties:
+        filename:
+          type: string
+          description: Nonblank, at most 255 UTF-8 bytes; no control characters or path separators; not . or ..
+        content_type:
+          type: string
+          maxLength: 127
+          description: ASCII file type/subtype, no parameters, wildcards, multipart/* or message/* containers; caller must provide matching file bytes
+          example: application/pdf
+        content_base64:
+          type: string
+          format: byte
+          maxLength: 6990508
+          description: Standard Base64 with required padding, no whitespace, data URI prefix, or URL-safe alphabet; decoded files total at most 5 MiB
+        content_id:
+          type: string
+          nullable: true
+          minLength: 1
+          maxLength: 128
+          pattern: '^[A-Za-z0-9@._-]+$'
+          description: >-
+            Omit or set null for a normal attachment. Set for an inline image and
+            reference cid:VALUE in HTML. Requires html and a unique case-sensitive
+            ID per email, without angle brackets. Allowed inline media types are
+            image/png, image/jpeg, image/gif, and image/webp (case-insensitive).
     Job:
       type: object
       required: [id, status, created_at, updated_at, error_code]
