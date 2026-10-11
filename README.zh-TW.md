@@ -610,6 +610,80 @@ openssl s_client -starttls smtp -connect smtp.gmail.com:587 -servername smtp.gma
 
 GoDaddy Email 請依前面的[獨立 TLS、登入與寄信測試](#在-ubuntu-vps-單獨檢查-godaddy-smtp)逐步排查。
 
+## 檢測記憶體用量
+
+測量正在執行的 **release 執行檔**，與 `cargo build`／`cargo run` 的用量分開。在相同設定、請求大小與 worker 數量下，比較閒置、一般流量與預期最高負載。`/healthz` 不會回報記憶體用量；本專案目前尚未建立實測的記憶體需求數字。
+
+### Ubuntu VPS：服務用量與主機容量
+
+服務執行中，在 VPS 的 Bash 執行：
+
+```sh
+# 服務用量的人類可讀格式；下方原始屬性值以 bytes 計。
+sudo systemctl status courier-hub --no-pager
+systemctl show courier-hub -p MainPID -p MemoryAccounting \
+  -p MemoryCurrent -p MemoryPeak -p MemorySwapCurrent
+
+# 每兩秒更新；Ctrl+C 停止監看。
+watch -n 2 'systemctl show courier-hub -p MainPID -p MemoryCurrent -p MemoryPeak -p MemorySwapCurrent'
+
+# 整台主機的 RAM 與 swap，單位為 MiB。
+free -m
+```
+
+`MemoryCurrent` 統計服務 cgroup 的用量，包含其程序及歸屬於它的檔案快取／核心記憶體，不只是 Rust heap。`MemoryPeak` 是 cgroup 的峰值，`MemorySwapCurrent` 另外列出 swap。峰值取決於 cgroup 的生命週期，重新建立時可能歸零；bytes 除以 1048576 即為 MiB。屬性見 [systemd 文件](https://github.com/systemd/systemd/blob/v255/man/org.freedesktop.systemd1.xml)；峰值／swap 屬性需要 systemd 255 以上及對應核心／cgroup 支援（部署目標 Ubuntu 24.04 使用 systemd 255）。缺值或 `[not set]` 代表無法取得，不代表用量為零。
+
+若 `MemoryAccounting=no`，可先執行 `sudo systemctl set-property --runtime courier-hub.service MemoryAccounting=yes` 暫時啟用，再重新查詢；此設定在主機重開機後失效。若要永久啟用，以 `sudo systemctl edit courier-hub` 建立 drop-in，在 `[Service]` 下加入 `MemoryAccounting=yes`，再執行 `sudo systemctl daemon-reload`，於適合的維護時段重啟服務。參考 [systemd 記憶體統計設定](https://github.com/systemd/systemd/blob/v255/man/systemd.resource-control.xml)。
+
+若只想看**主程序本身**的常駐 RAM 與峰值：
+
+```sh
+(
+courier_pid=$(systemctl show courier-hub -p MainPID --value)
+if [ "${courier_pid:-0}" -le 0 ]; then
+  echo 'courier-hub is not running.' >&2
+  exit 1
+fi
+ps -p "$courier_pid" -o pid=,comm=,rss=,vsz=,%mem=
+sudo awk '/^(VmRSS|VmHWM|VmSwap):/ {print}' "/proc/$courier_pid/status"
+)
+```
+
+`RSS`／`VmRSS` 是常駐 RAM，`VmHWM` 是該程序的常駐 RAM 峰值，`VmSwap` 是換出到 swap 的私人匿名記憶體。Linux 這些數字以 KiB 計，雖然 `/proc` 標示為 `kB`；除以 1024 即為 MiB。`VSZ` 是虛擬位址空間，不是實體 RAM 用量。RSS 包含共享頁面且為近似值；若需要更詳細的快照，可查看 `/proc/PID/smaps_rollup` 的 `Rss`／`Pss`，PSS 會按比例分攤共享頁面。參考 [Linux 核心 `/proc` 文件](https://www.kernel.org/doc/html/latest/filesystems/proc.html)。`free -m` 應看 `available` 判斷主機餘裕；單看 `free` 偏低可能只是可回收快取。整機統計也包含 Nginx 與其他服務。
+
+若要每五秒將主程序 RSS 記錄成私人 CSV，請在專案目錄以外、可寫入的目錄執行。檔案含時間戳並建立於該目錄，Ctrl+C 停止記錄。每次取樣重新取得 PID，因此可以看到服務重啟：
+
+```sh
+(
+courier_memory_log="courier-hub-memory-$(date -u +%Y%m%dT%H%M%SZ).csv"
+printf 'timestamp_utc,pid,rss_mib\n' > "$courier_memory_log"
+while :; do
+  courier_pid=$(systemctl show courier-hub -p MainPID --value)
+  courier_rss=''
+  if [ "${courier_pid:-0}" -gt 0 ]; then
+    courier_rss=$(ps -p "$courier_pid" -o rss= | awk '{printf "%.2f", $1 / 1024}')
+  fi
+  printf '%s,%s,%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${courier_pid:-0}" "$courier_rss" >> "$courier_memory_log"
+  sleep 5
+done
+)
+```
+
+RSS 欄位空白代表該次取樣無法取得程序。定期取樣可能漏掉短暫尖峰，因此也要搭配峰值計數器。保存結果時一併記錄建置版本、設定、流量與測試時間；流量結束後用量仍偏高，單憑這點不能判定記憶體洩漏。應讓工作完成，觀察重複相近負載時是否持續成長。
+
+### Windows：PowerShell 程序快照
+
+使用私人設定啟動 `target/release/courier-hub.exe`，再於另一個 PowerShell 視窗執行：
+
+```powershell
+Get-Process -Name courier-hub -ErrorAction Stop | Select-Object Id, ProcessName,
+    @{Name='WorkingSetMiB'; Expression={[math]::Round($_.WorkingSet64 / 1MB, 2)}},
+    @{Name='PrivateMiB'; Expression={[math]::Round($_.PrivateMemorySize64 / 1MB, 2)}},
+    @{Name='PeakWorkingSetMiB'; Expression={[math]::Round($_.PeakWorkingSet64 / 1MB, 2)}}
+```
+
+`WorkingSetMiB` 是目前常駐實體記憶體，含共享頁面。`PrivateMiB` 是程序私人配置的記憶體，可包含不在 RAM 的頁面，不是另一個常駐 RAM 總量。`PeakWorkingSetMiB` 是程序啟動以來的常駐記憶體峰值。PowerShell 的 `1MB` 等於 1048576 bytes。參考 Microsoft 的 [working set](https://learn.microsoft.com/en-us/dotnet/api/system.diagnostics.process.workingset64) 與[私人記憶體](https://learn.microsoft.com/en-us/dotnet/api/system.diagnostics.process.privatememorysize64)定義。若列出多個實例，以 `Get-Process -Id PROCESS_ID` 指定目標 PID。也可以在工作管理員的「詳細資料」頁加入工作集、尖峰工作集與認可大小欄位。這些程序用量不包含 Cargo、Nginx 或其他服務。
+
 ## 開發與驗證
 
 ```sh

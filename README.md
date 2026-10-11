@@ -610,6 +610,80 @@ Use your provider's hostname instead. For implicit TLS on port 465, omit `-start
 
 For GoDaddy Email, follow the [independent TLS, authentication, and delivery checks](#check-godaddy-smtp-independently-on-the-ubuntu-vps) above.
 
+## Measuring memory usage
+
+Measure the running **release executable**, separately from `cargo build` or `cargo run`. Compare idle, normal traffic, and your expected busiest workload with the same configuration, request sizes, and worker count. `/healthz` does not report memory usage. No measured memory budget is established for this project yet.
+
+### Ubuntu VPS: service usage and host capacity
+
+Run in Bash on the VPS while the service is running:
+
+```sh
+# Human-readable service memory; raw values below are in bytes.
+sudo systemctl status courier-hub --no-pager
+systemctl show courier-hub -p MainPID -p MemoryAccounting \
+  -p MemoryCurrent -p MemoryPeak -p MemorySwapCurrent
+
+# Refresh every two seconds; Ctrl+C stops monitoring.
+watch -n 2 'systemctl show courier-hub -p MainPID -p MemoryCurrent -p MemoryPeak -p MemorySwapCurrent'
+
+# Whole-host RAM and swap, in MiB.
+free -m
+```
+
+`MemoryCurrent` accounts for the service's cgroup, including its processes and charged file cache/kernel memory; it is not just Rust heap usage. `MemoryPeak` is the cgroup high-water mark, and `MemorySwapCurrent` reports swap separately. Peaks depend on the cgroup's lifetime and may reset when it is recreated. Divide byte values by 1048576 to get MiB. These properties are documented by [systemd](https://github.com/systemd/systemd/blob/v255/man/org.freedesktop.systemd1.xml); peak/swap properties require systemd 255 or newer and suitable kernel/cgroup support (the Ubuntu 24.04 target uses systemd 255). Missing values or `[not set]` mean unavailable, not zero.
+
+If `MemoryAccounting=no`, enable it temporarily with `sudo systemctl set-property --runtime courier-hub.service MemoryAccounting=yes`, then query again; this setting lasts until reboot. For persistent accounting, add `MemoryAccounting=yes` under `[Service]` in a drop-in using `sudo systemctl edit courier-hub`, then run `sudo systemctl daemon-reload` and restart during a suitable maintenance window. See [systemd memory accounting](https://github.com/systemd/systemd/blob/v255/man/systemd.resource-control.xml).
+
+For the **main process only**, inspect resident RAM and its peak:
+
+```sh
+(
+courier_pid=$(systemctl show courier-hub -p MainPID --value)
+if [ "${courier_pid:-0}" -le 0 ]; then
+  echo 'courier-hub is not running.' >&2
+  exit 1
+fi
+ps -p "$courier_pid" -o pid=,comm=,rss=,vsz=,%mem=
+sudo awk '/^(VmRSS|VmHWM|VmSwap):/ {print}' "/proc/$courier_pid/status"
+)
+```
+
+`RSS` / `VmRSS` is resident RAM, `VmHWM` is peak resident RAM for that process, and `VmSwap` is swapped private anonymous memory. Linux reports these sizes in KiB despite `/proc` using the label `kB`; divide by 1024 for MiB. `VSZ` is virtual address space, not physical RAM consumption. RSS includes shared pages and is approximate; use `/proc/PID/smaps_rollup` (`Rss` / `Pss`) for a more detailed snapshot, with shared pages apportioned in PSS. See the [Linux kernel's `/proc` documentation](https://www.kernel.org/doc/html/latest/filesystems/proc.html). In `free -m`, use `available` to assess host headroom; low `free` alone can reflect reclaimable cache. Host totals also include Nginx and other services.
+
+To keep a local CSV of main-process RSS every five seconds, run this in a writable directory outside the checkout. The timestamped file is created there; Ctrl+C stops recording. Each sample fetches the current PID so a service restart is visible:
+
+```sh
+(
+courier_memory_log="courier-hub-memory-$(date -u +%Y%m%dT%H%M%SZ).csv"
+printf 'timestamp_utc,pid,rss_mib\n' > "$courier_memory_log"
+while :; do
+  courier_pid=$(systemctl show courier-hub -p MainPID --value)
+  courier_rss=''
+  if [ "${courier_pid:-0}" -gt 0 ]; then
+    courier_rss=$(ps -p "$courier_pid" -o rss= | awk '{printf "%.2f", $1 / 1024}')
+  fi
+  printf '%s,%s,%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${courier_pid:-0}" "$courier_rss" >> "$courier_memory_log"
+  sleep 5
+done
+)
+```
+
+An empty RSS field means the process was unavailable at that sample. Sampling can miss short spikes; use the peak counters alongside the CSV. Record the build revision, settings, traffic rate, and test duration with results. An elevated value after traffic alone does not establish a leak; look for continued growth over repeated comparable workloads, allowing time for jobs to finish.
+
+### Windows: PowerShell process snapshot
+
+Start `target/release/courier-hub.exe` using your private configuration, then run this in another PowerShell window:
+
+```powershell
+Get-Process -Name courier-hub -ErrorAction Stop | Select-Object Id, ProcessName,
+    @{Name='WorkingSetMiB'; Expression={[math]::Round($_.WorkingSet64 / 1MB, 2)}},
+    @{Name='PrivateMiB'; Expression={[math]::Round($_.PrivateMemorySize64 / 1MB, 2)}},
+    @{Name='PeakWorkingSetMiB'; Expression={[math]::Round($_.PeakWorkingSet64 / 1MB, 2)}}
+```
+
+`WorkingSetMiB` is currently resident physical memory, including shared pages. `PrivateMiB` is private allocated memory and can include nonresident pages; it is not another resident-RAM total. `PeakWorkingSetMiB` is the process's resident-memory peak since startup. PowerShell's `1MB` equals 1048576 bytes. See Microsoft's [working set](https://learn.microsoft.com/en-us/dotnet/api/system.diagnostics.process.workingset64) and [private memory](https://learn.microsoft.com/en-us/dotnet/api/system.diagnostics.process.privatememorysize64) definitions. If several instances are listed, select the intended process by PID with `Get-Process -Id PROCESS_ID`. Task Manager's **Details** tab can also show working set, peak working set, and commit size. These process measurements exclude Cargo, Nginx, and other services.
+
 ## Development and verification
 
 
