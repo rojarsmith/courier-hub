@@ -352,7 +352,7 @@ SMTP provides no end-to-end exactly-once guarantee. This version does not automa
 
 ## Deploy to an Ubuntu VPS
 
-This walkthrough targets Ubuntu 24.04 LTS with systemd. Run the commands in Bash on the VPS, using a normal administrative account with `sudo`, rather than in local Windows PowerShell. Build on the VPS to match its CPU architecture and Linux libraries. Compilation can need more RAM or swap than running the service.
+This walkthrough targets Ubuntu 26.04 LTS with systemd; differences from Ubuntu 24.04 LTS are noted below. Run the commands in Bash on the VPS, using a normal administrative account with `sudo`, rather than in local Windows PowerShell. Build on the VPS to match its CPU architecture and Linux libraries. Compilation can need more RAM or swap than running the service.
 
 Use this layout: **Internet → Nginx HTTPS :443 → Courier Hub 127.0.0.1:8080 → third-party SMTP**. systemd starts the service at boot and restarts it after a failure.
 
@@ -367,6 +367,25 @@ Use this layout: **Internet → Nginx HTTPS :443 → Courier Hub 127.0.0.1:8080 
 
 The shared, secret-free templates are in [deploy/ubuntu](deploy/ubuntu). The instructions below do not deploy anything automatically from your development machine.
 
+### Ubuntu 26.04 LTS differences
+
+| Change from 24.04 LTS | Effect on Courier Hub |
+| --- | --- |
+| systemd 255 → 259 | The memory commands below still apply, including `MemoryCurrent`, `MemoryPeak`, and `MemorySwapCurrent`. |
+| cgroup v1 support removed | Use cgroup v2; this also matters for VPS containers whose host controls the cgroup hierarchy. |
+| `/tmp` defaults to tmpfs | Temporary files can consume RAM/swap. Keep the source/build, SQLite data, backups, and measurement CSVs on persistent disk. |
+
+See Ubuntu's [LTS comparison](https://documentation.ubuntu.com/release-notes/26.04/summary-for-lts-users/) and [cgroup compatibility notes](https://documentation.ubuntu.com/release-notes/26.04/changes-since-previous-interim/#cgroup-v1-support-has-been-removed). Check your actual VPS image; provider images and upgraded machines can have overrides:
+
+```sh
+cat /etc/os-release
+systemctl --version
+findmnt -no FSTYPE /sys/fs/cgroup
+findmnt -T /tmp -o TARGET,FSTYPE,OPTIONS
+```
+
+Expect `cgroup2` for the cgroup filesystem. This compatibility review found no required version-specific changes to the service/Nginx templates or rustup build commands. It is not a completed deployment test on Ubuntu 26.04: run `systemd-analyze verify`, `nginx -t`, health, and delivery checks below on the VPS. The build remains pinned to Rust 1.88.0 by `rust-toolchain.toml`; upgrading Ubuntu does not require switching to Ubuntu's packaged Rust.
+
 ### 1. Prepare DNS, packages, and the firewall
 
 Point an API hostname such as `api.example.com` at the VPS public IP with a DNS A record. Add an AAAA record only if the server has working public IPv6. For initial certificate issuance, DNS and any CDN/proxy must let HTTP requests to the ACME challenge path reach the VPS. Replace `api.example.com` below with your hostname and keep the same Bash session for the deployment commands.
@@ -378,7 +397,7 @@ ssh ubuntu@VPS_IP
 # Run the remaining commands on Ubuntu.
 api_domain=api.example.com
 sudo apt update
-sudo apt install -y build-essential curl git ca-certificates pkg-config nginx ufw snapd openssl
+sudo apt install -y build-essential curl git ca-certificates pkg-config nginx ufw snapd openssl procps
 
 # Allow your actual SSH port BEFORE enabling UFW.
 sudo ufw allow OpenSSH
@@ -631,7 +650,7 @@ watch -n 2 'systemctl show courier-hub -p MainPID -p MemoryCurrent -p MemoryPeak
 free -m
 ```
 
-`MemoryCurrent` accounts for the service's cgroup, including its processes and charged file cache/kernel memory; it is not just Rust heap usage. `MemoryPeak` is the cgroup high-water mark, and `MemorySwapCurrent` reports swap separately. Peaks depend on the cgroup's lifetime and may reset when it is recreated. Divide byte values by 1048576 to get MiB. These properties are documented by [systemd](https://github.com/systemd/systemd/blob/v255/man/org.freedesktop.systemd1.xml); peak/swap properties require systemd 255 or newer and suitable kernel/cgroup support (the Ubuntu 24.04 target uses systemd 255). Missing values or `[not set]` mean unavailable, not zero.
+`MemoryCurrent` accounts for the service's cgroup, including its processes and charged file cache/kernel memory; it is not just Rust heap usage. `MemoryPeak` is the cgroup high-water mark, and `MemorySwapCurrent` reports swap separately. Peaks depend on the cgroup's lifetime and may reset when it is recreated. Divide byte values by 1048576 to get MiB. These properties are documented by [systemd](https://github.com/systemd/systemd/blob/v259/man/org.freedesktop.systemd1.xml); peak/swap properties require systemd 255 or newer and suitable kernel/cgroup support (Ubuntu 26.04 uses systemd 259; Ubuntu 24.04 uses 255). Missing values or `[not set]` mean unavailable, not zero. If `ps`, `free`, or `watch` is missing on a minimal image, install `procps` with `sudo apt install -y procps`.
 
 If `MemoryAccounting=no`, enable it temporarily with `sudo systemctl set-property --runtime courier-hub.service MemoryAccounting=yes`, then query again; this setting lasts until reboot. For persistent accounting, add `MemoryAccounting=yes` under `[Service]` in a drop-in using `sudo systemctl edit courier-hub`, then run `sudo systemctl daemon-reload` and restart during a suitable maintenance window. See [systemd memory accounting](https://github.com/systemd/systemd/blob/v255/man/systemd.resource-control.xml).
 

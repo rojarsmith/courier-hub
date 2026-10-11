@@ -352,7 +352,7 @@ SMTP 不提供端到端 exactly-once 保證。本版不自動重試寄送，連�
 
 ## 部署到 Ubuntu VPS
 
-以下流程以 Ubuntu 24.04 LTS 與 systemd 為目標。指令應在 VPS 的 Bash／SSH 工作階段內，以有 `sudo` 權限的一般管理帳號執行，不是在本機 Windows PowerShell 執行。在 VPS 上建置，可符合該機器的 CPU 架構與 Linux 函式庫；編譯時可能需要比執行服務更多的記憶體或 swap。
+以下流程以 Ubuntu 26.04 LTS 與 systemd 為目標，與 Ubuntu 24.04 LTS 的差異列於下方。指令應在 VPS 的 Bash／SSH 工作階段內，以有 `sudo` 權限的一般管理帳號執行，不是在本機 Windows PowerShell 執行。在 VPS 上建置，可符合該機器的 CPU 架構與 Linux 函式庫；編譯時可能需要比執行服務更多的記憶體或 swap。
 
 部署架構為：**Internet → Nginx HTTPS :443 → Courier Hub 127.0.0.1:8080 → 第三方 SMTP**。systemd 負責開機啟動，以及程序失敗後重新啟動。
 
@@ -367,6 +367,25 @@ SMTP 不提供端到端 exactly-once 保證。本版不自動重試寄送，連�
 
 兩種語言共用 [deploy/ubuntu](deploy/ubuntu) 中不含秘密的範本。以下是操作說明，不會從開發電腦自動部署到你的 VPS。
 
+### Ubuntu 26.04 LTS 差異
+
+| 相較於 24.04 LTS 的變動 | 對 Courier Hub 的影響 |
+| --- | --- |
+| systemd 255 → 259 | 下方記憶體指令仍適用，包含 `MemoryCurrent`、`MemoryPeak`、`MemorySwapCurrent`。 |
+| 移除 cgroup v1 支援 | 使用 cgroup v2；若 VPS 是容器，也要注意宿主機控制的 cgroup 架構。 |
+| `/tmp` 預設改為 tmpfs | 暫存檔可能消耗 RAM／swap；原始碼與建置、SQLite 資料、備份、量測 CSV 應放在持久磁碟。 |
+
+參考 Ubuntu 官方的 [LTS 比較](https://documentation.ubuntu.com/release-notes/26.04/summary-for-lts-users/)與 [cgroup 相容性說明](https://documentation.ubuntu.com/release-notes/26.04/changes-since-previous-interim/#cgroup-v1-support-has-been-removed)。請確認 VPS 實際設定；供應商映像與升級安裝可能另有覆寫：
+
+```sh
+cat /etc/os-release
+systemctl --version
+findmnt -no FSTYPE /sys/fs/cgroup
+findmnt -T /tmp -o TARGET,FSTYPE,OPTIONS
+```
+
+cgroup 檔案系統應顯示 `cgroup2`。本次相容性審閱未發現服務／Nginx 範本或 rustup 建置指令需要因版本而修改，但尚未完成 Ubuntu 26.04 實機部署測試；請在 VPS 執行下方的 `systemd-analyze verify`、`nginx -t`、健康與寄送檢查。`rust-toolchain.toml` 仍固定 Rust 1.88.0，升級 Ubuntu 不需要改用 Ubuntu 套件庫的 Rust。
+
 ### 1. 準備 DNS、套件與防火牆
 
 將 API 網域（例如 `api.example.com`）的 DNS A 紀錄指向 VPS 公開 IP。只有伺服器確實能使用公開 IPv6 時才加入 AAAA 紀錄。第一次申請憑證時，DNS 與 CDN／代理必須讓 ACME 驗證路徑的 HTTP 請求到達 VPS。將下方的 `api.example.com` 改成自己的網域，並在同一個 Bash 工作階段完成部署。
@@ -378,7 +397,7 @@ ssh ubuntu@VPS_IP
 # 以下指令在 Ubuntu 執行。
 api_domain=api.example.com
 sudo apt update
-sudo apt install -y build-essential curl git ca-certificates pkg-config nginx ufw snapd openssl
+sudo apt install -y build-essential curl git ca-certificates pkg-config nginx ufw snapd openssl procps
 
 # 啟用 UFW 前，先放行實際使用的 SSH 連接埠。
 sudo ufw allow OpenSSH
@@ -631,7 +650,7 @@ watch -n 2 'systemctl show courier-hub -p MainPID -p MemoryCurrent -p MemoryPeak
 free -m
 ```
 
-`MemoryCurrent` 統計服務 cgroup 的用量，包含其程序及歸屬於它的檔案快取／核心記憶體，不只是 Rust heap。`MemoryPeak` 是 cgroup 的峰值，`MemorySwapCurrent` 另外列出 swap。峰值取決於 cgroup 的生命週期，重新建立時可能歸零；bytes 除以 1048576 即為 MiB。屬性見 [systemd 文件](https://github.com/systemd/systemd/blob/v255/man/org.freedesktop.systemd1.xml)；峰值／swap 屬性需要 systemd 255 以上及對應核心／cgroup 支援（部署目標 Ubuntu 24.04 使用 systemd 255）。缺值或 `[not set]` 代表無法取得，不代表用量為零。
+`MemoryCurrent` 統計服務 cgroup 的用量，包含其程序及歸屬於它的檔案快取／核心記憶體，不只是 Rust heap。`MemoryPeak` 是 cgroup 的峰值，`MemorySwapCurrent` 另外列出 swap。峰值取決於 cgroup 的生命週期，重新建立時可能歸零；bytes 除以 1048576 即為 MiB。屬性見 [systemd 文件](https://github.com/systemd/systemd/blob/v259/man/org.freedesktop.systemd1.xml)；峰值／swap 屬性需要 systemd 255 以上及對應核心／cgroup 支援（Ubuntu 26.04 使用 systemd 259；Ubuntu 24.04 使用 255）。缺值或 `[not set]` 代表無法取得，不代表用量為零。精簡映像若缺少 `ps`、`free` 或 `watch`，執行 `sudo apt install -y procps` 安裝。
 
 若 `MemoryAccounting=no`，可先執行 `sudo systemctl set-property --runtime courier-hub.service MemoryAccounting=yes` 暫時啟用，再重新查詢；此設定在主機重開機後失效。若要永久啟用，以 `sudo systemctl edit courier-hub` 建立 drop-in，在 `[Service]` 下加入 `MemoryAccounting=yes`，再執行 `sudo systemctl daemon-reload`，於適合的維護時段重啟服務。參考 [systemd 記憶體統計設定](https://github.com/systemd/systemd/blob/v255/man/systemd.resource-control.xml)。
 
