@@ -414,7 +414,7 @@ SMTP 不提供端到端 exactly-once 保證。本版不自動重試寄送，連�
 
 以下流程以 Ubuntu 26.04 LTS 與 systemd 為目標，與 Ubuntu 24.04 LTS 的差異列於下方。指令應在 VPS 的 Bash／SSH 工作階段內，以有 `sudo` 權限的一般管理帳號執行，不是在本機 Windows PowerShell 執行。在 VPS 上建置，可符合該機器的 CPU 架構與 Linux 函式庫；編譯時可能需要比執行服務更多的記憶體或 swap。
 
-部署架構為：**Internet → Nginx HTTPS :443 → Courier Hub 127.0.0.1:8080 → 第三方 SMTP**。systemd 負責開機啟動，以及程序失敗後重新啟動。
+部署架構為：**Internet → Nginx HTTPS :443 → Courier Hub 127.0.0.1:61873 → 第三方 SMTP**。systemd 負責開機啟動，以及程序失敗後重新啟動。
 
 | 路徑 | 用途 |
 | --- | --- |
@@ -460,8 +460,34 @@ ssh ubuntu@VPS_IP
 
 # 以下指令在 Ubuntu 執行。
 api_domain=api.example.com
-api_port=8080
+api_port=61873
 ```
+
+此 Ubuntu 部署建議使用 `61873`：它位於 IANA 的[動態／私人使用範圍（49152–65535）](https://www.iana.org/assignments/service-names-port-numbers)，不分配給特定服務，且位於 Linux [預設自動分配本機連接埠範圍（32768–60999）](https://kernel.org/doc/html/latest/networking/ip-sysctl.html)之外。這是部署選擇，不是專屬分配，也不保證不會衝突。程式與原始範本仍預設使用 `8080`；下方安裝指令會將環境檔與 Nginx 設定同步替換成 `api_port`。
+
+候選連接埠依選用順序如下；三者皆符合上述範圍條件，但沒有統計證據顯示其中一個的衝突率較低，最後以 VPS 實際配置與占用情況為準。
+
+| 順序 | TCP 連接埠 | 用途 |
+| --- | --- | --- |
+| 1 | `61873` | 主要建議 |
+| 2 | `62471` | 備選一 |
+| 3 | `63197` | 備選二 |
+
+安裝前在實際 VPS 一次檢查三個候選：
+
+```sh
+sysctl net.ipv4.ip_local_port_range
+sudo ss -H -tanp '( sport = :61873 or sport = :62471 or sport = :63197 )'
+```
+
+選擇未占用且不在主機實際自動分配範圍內的一個連接埠；若改用備選，將前面的 `api_port` 改為 `62471` 或 `63197`。安裝前再次檢查所選值：
+
+```sh
+sysctl net.ipv4.ip_local_port_range
+sudo ss -H -tanp "sport = :${api_port:?Set api_port}"
+```
+
+`ss` 沒有輸出代表當下未查到符合的 TCP socket。確認實際自動分配範圍不包含所選連接埠；若包含，改選其他連接埠，或在保留既有預留項目的前提下，明確設定 `ip_local_reserved_ports`。後端維持綁定 `127.0.0.1`，對外 HTTPS 仍使用 443。既有部署可保留目前未衝突的後端連接埠；若要更換，需同步修改 `BIND_ADDR` 與 `proxy_pass`、重啟 Courier Hub，並測試及 reload Nginx。
 
 **部署前盤點（兩種情境都要做）：**
 
@@ -480,7 +506,7 @@ getent passwd courier-hub
 
 未安裝套件或尚未建立的路徑回報不存在是正常的；其他錯誤需先處理。`nginx -T` 可能包含私人設定，只在自己的終端檢視。確認：
 
-- 所選 `api_port` 未被其他服務占用（包括 `0.0.0.0`／IPv6 wildcard）。若 8080 已使用，改成例如 `api_port=18080`；後續設定與檢查共用這個值。只使用 1024～65535 的整數，網域使用實際 ASCII DNS hostname，不含 scheme、連接埠、路徑或萬用字元。
+- 所選 `api_port` 未被其他服務占用（包括 `0.0.0.0`／IPv6 wildcard）。若所選連接埠已使用，改選另一個未占用且不在主機實際自動分配範圍內的連接埠；後續設定與檢查共用這個值。只使用 1024～65535 的整數，網域使用實際 ASCII DNS hostname，不含 scheme、連接埠、路徑或萬用字元。
 - 新網域沒有既有的同名 `server_name` 或憑證用途；保留既有 default server，避免新增檔案的載入順序改變未匹配網域的路由。檢查 `courier_hub_per_ip`、`CourierHubTLS` 名稱未被其他設定使用，且主機支援範本的 IPv6 listen。
 - 若上述 Courier Hub 路徑或帳號已存在，先確認是否為既有部署；既有部署走第 8 節更新流程，不重跑初次安裝。
 - 記錄現有網站的 HTTPS 健康檢查 URL、狀態與代表性內容，部署後以相同方式比較；單看 `nginx -t` 不足以驗證路由正確。
@@ -551,7 +577,7 @@ sudo nano /etc/courier-hub/service.env
 )
 ```
 
-將產生的值填入 `API_KEY`，並替換所有 SMTP 帳號佔位值。`BIND_ADDR` 由上方安裝步驟填入所選連接埠，保留 `DATA_DIR=/var/lib/courier-hub`。環境檔內必須是實際數字，例如 `BIND_ADDR=127.0.0.1:18080`，不能填 `$api_port`。私人設定檔在 Git 之外，不要將內容寫進部署腳本或 commit。Gmail 應用程式密碼與自有網域信箱設定請參考前面的 SMTP 章節。
+將產生的值填入 `API_KEY`，並替換所有 SMTP 帳號佔位值。`BIND_ADDR` 由上方安裝步驟填入所選連接埠，保留 `DATA_DIR=/var/lib/courier-hub`。環境檔內必須是實際數字，例如 `BIND_ADDR=127.0.0.1:61873`，不能填 `$api_port`。私人設定檔在 Git 之外，不要將內容寫進部署腳本或 commit。Gmail 應用程式密碼與自有網域信箱設定請參考前面的 SMTP 章節。
 
 此檔案使用 systemd `EnvironmentFile` 格式：每行 `KEY=value`，不加 `export`，也不做指令替換或變數展開。含空格的值要加引號，例如 `SMTP_FROM="Courier Hub <sender@example.com>"`。systemd 會在啟動低權限程序之前讀取 root 專用檔案；不要在 shell 中 `source` 它。本部署方式透過環境變數注入設定，不需要建立 `/opt/courier-hub/.env`。
 

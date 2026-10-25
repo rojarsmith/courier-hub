@@ -414,7 +414,7 @@ SMTP provides no end-to-end exactly-once guarantee. This version does not automa
 
 This walkthrough targets Ubuntu 26.04 LTS with systemd; differences from Ubuntu 24.04 LTS are noted below. Run the commands in Bash on the VPS, using a normal administrative account with `sudo`, rather than in local Windows PowerShell. Build on the VPS to match its CPU architecture and Linux libraries. Compilation can need more RAM or swap than running the service.
 
-Use this layout: **Internet → Nginx HTTPS :443 → Courier Hub 127.0.0.1:8080 → third-party SMTP**. systemd starts the service at boot and restarts it after a failure.
+Use this layout: **Internet → Nginx HTTPS :443 → Courier Hub 127.0.0.1:61873 → third-party SMTP**. systemd starts the service at boot and restarts it after a failure.
 
 | Location | Purpose |
 | --- | --- |
@@ -460,8 +460,34 @@ ssh ubuntu@VPS_IP
 
 # Run the remaining commands on Ubuntu.
 api_domain=api.example.com
-api_port=8080
+api_port=61873
 ```
+
+This Ubuntu deployment recommends `61873`: it is in IANA's [Dynamic/Private range (49152–65535)](https://www.iana.org/assignments/service-names-port-numbers), which is not assigned to specific services, and outside Linux's [default automatic local port range (32768–60999)](https://kernel.org/doc/html/latest/networking/ip-sysctl.html). This is a deployment choice, not an exclusive allocation or a guarantee against conflicts. The application and source templates still default to `8080`; the installation commands below replace that value with `api_port` in both the environment file and Nginx configuration.
+
+Use the candidates in the following order. All three satisfy the range criteria above, but no statistical evidence establishes a lower collision rate for any one of them; the VPS's actual configuration and port usage determine suitability.
+
+| Order | TCP port | Purpose |
+| --- | --- | --- |
+| 1 | `61873` | Primary recommendation |
+| 2 | `62471` | First alternative |
+| 3 | `63197` | Second alternative |
+
+Check all three candidates on the actual VPS before installing:
+
+```sh
+sysctl net.ipv4.ip_local_port_range
+sudo ss -H -tanp '( sport = :61873 or sport = :62471 or sport = :63197 )'
+```
+
+Choose an unused port outside the host's actual automatic allocation range. If using an alternative, change the earlier `api_port` to `62471` or `63197`. Recheck the selected value before installation:
+
+```sh
+sysctl net.ipv4.ip_local_port_range
+sudo ss -H -tanp "sport = :${api_port:?Set api_port}"
+```
+
+No output from `ss` means no matching TCP socket was found at that moment. Confirm that the reported automatic allocation range excludes the selected port; if it includes it, choose another port or deliberately reserve it using `ip_local_reserved_ports` while preserving existing reservations. Keep the backend bound to `127.0.0.1`; public HTTPS remains on port 443. Existing deployments can keep their current free backend port. Changing it requires updating both `BIND_ADDR` and `proxy_pass`, restarting Courier Hub, and testing/reloading Nginx together.
 
 **Preflight inventory (both paths):**
 
@@ -480,7 +506,7 @@ getent passwd courier-hub
 
 Missing packages/paths are expected on a fresh machine; resolve other errors before continuing. `nginx -T` can contain private configuration: inspect it only in your own terminal. Confirm:
 
-- The selected `api_port` is free, including wildcard IPv4/IPv6 listeners. If 8080 is taken, choose e.g. `api_port=18080`; subsequent setup and checks use that value. Use an integer from 1024 through 65535 and a real ASCII DNS hostname without a scheme, port, path, or wildcard.
+- The selected `api_port` is free, including wildcard IPv4/IPv6 listeners. If the selected port is occupied, choose another unused port outside the host's actual automatic allocation range; subsequent setup and checks use that value. Use an integer from 1024 through 65535 and a real ASCII DNS hostname without a scheme, port, path, or wildcard.
 - The hostname has no existing matching `server_name` or certificate use. Preserve the existing default server so file ordering cannot change unmatched-host routing. Check that `courier_hub_per_ip` and `CourierHubTLS` are unused and that the host supports the template's IPv6 listeners.
 - If any Courier Hub paths or the account already exist, identify them first. Use step 8 for an existing deployment instead of repeating initial installation.
 - Record existing sites' HTTPS health URLs, status, and representative content; repeat those checks after deployment. `nginx -t` alone does not verify routing.
@@ -551,7 +577,7 @@ sudo nano /etc/courier-hub/service.env
 )
 ```
 
-Set `API_KEY` to the generated value and replace all SMTP account placeholders. The installation block fills `BIND_ADDR` with your chosen port; keep `DATA_DIR=/var/lib/courier-hub`. The environment file must contain the actual number, e.g. `BIND_ADDR=127.0.0.1:18080`, not `$api_port`. The private file is outside Git; never put its contents in deployment scripts or commits. See the SMTP setup section for Gmail app passwords or your domain mailbox provider's settings.
+Set `API_KEY` to the generated value and replace all SMTP account placeholders. The installation block fills `BIND_ADDR` with your chosen port; keep `DATA_DIR=/var/lib/courier-hub`. The environment file must contain the actual number, e.g. `BIND_ADDR=127.0.0.1:61873`, not `$api_port`. The private file is outside Git; never put its contents in deployment scripts or commits. See the SMTP setup section for Gmail app passwords or your domain mailbox provider's settings.
 
 The file uses systemd `EnvironmentFile` syntax: one `KEY=value` per line, without `export`, command substitution, or variable expansion. Quote a value containing spaces, for example `SMTP_FROM="Courier Hub <sender@example.com>"`. systemd reads the root-only file before starting the unprivileged process; do not `source` it in a shell. This deployment uses environment injection and does not need `/opt/courier-hub/.env`.
 
