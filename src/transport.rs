@@ -258,7 +258,7 @@ mod tests {
                 .with_no_client_auth()
                 .with_single_cert(
                     vec![cert.cert.der().clone()],
-                    rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der())
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())
                         .into(),
                 )
                 .unwrap();
@@ -391,7 +391,7 @@ mod tests {
                 .with_no_client_auth()
                 .with_single_cert(
                     vec![cert.cert.der().clone()],
-                    rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der())
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())
                         .into(),
                 )
                 .unwrap();
