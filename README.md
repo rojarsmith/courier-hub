@@ -90,7 +90,7 @@ Only `.env` in the current working directory is read; parent directories are not
 cargo run --locked
 ```
 
-The default listener is `127.0.0.1:8080`. For production, run `cargo build --release --locked`, then execute `target/release/courier-hub.exe` on Windows or `target/release/courier-hub` on Linux/macOS. Build for each target platform; a Windows executable does not run directly on Linux.
+The default listener is `127.0.0.1:61873`. For production, run `cargo build --release --locked`, then execute `target/release/courier-hub.exe` on Windows or `target/release/courier-hub` on Linux/macOS. Build for each target platform; a Windows executable does not run directly on Linux.
 
 The GitHub Actions test matrix covers Windows, Linux, and macOS; local verification was performed on Windows. Startup creates a private `data/` directory and SQLite database. Ctrl+C stops new work and waits for the current delivery attempts to finish; Unix also handles SIGTERM.
 
@@ -109,23 +109,23 @@ $body = @{
     subject = 'Asynchronous email test'
     text = 'This message was relayed by Courier Hub.'
 } | ConvertTo-Json
-$job = Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8080/v1/emails' `
+$job = Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:61873/v1/emails' `
     -Headers $headers -ContentType 'application/json; charset=utf-8' `
     -Body ([System.Text.Encoding]::UTF8.GetBytes($body))
 $job
-Invoke-RestMethod -Uri "http://127.0.0.1:8080/v1/jobs/$($job.id)" -Headers $headers
+Invoke-RestMethod -Uri "http://127.0.0.1:61873/v1/jobs/$($job.id)" -Headers $headers
 ```
 
 Linux/macOS (`COURIER_API_KEY` comes from your client's private configuration):
 
 ```sh
-curl -i http://127.0.0.1:8080/v1/emails \
+curl -i http://127.0.0.1:61873/v1/emails \
   -H "Authorization: Bearer $COURIER_API_KEY" \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: example-request-001' \
   --data '{"to":["recipient@example.com"],"subject":"Hello","text":"Hello from Courier Hub"}'
 
-curl http://127.0.0.1:8080/v1/jobs/WORK_ID \
+curl http://127.0.0.1:61873/v1/jobs/WORK_ID \
   -H "Authorization: Bearer $COURIER_API_KEY"
 ```
 
@@ -369,7 +369,7 @@ Other response codes: 400 for invalid keys, job IDs, or malformed JSON; 401 for 
 | Environment variable | Default / range |
 | --- | --- |
 | `API_KEY` | Required; 32–256 printable ASCII characters without whitespace. Generate a hex value from 32 random bytes. |
-| `BIND_ADDR` | `127.0.0.1:8080`, IP:port |
+| `BIND_ADDR` | `127.0.0.1:61873`, IP:port |
 | `DATA_DIR` | `data`, a private local data directory |
 | `SMTP_HOST` | Required; SMTP DNS hostname |
 | `SMTP_PORT` | 587 for STARTTLS or 465 for implicit TLS by default; 1–65535 |
@@ -463,7 +463,7 @@ api_domain=api.example.com
 api_port=61873
 ```
 
-This Ubuntu deployment recommends `61873`: it is in IANA's [Dynamic/Private range (49152–65535)](https://www.iana.org/assignments/service-names-port-numbers), which is not assigned to specific services, and outside Linux's [default automatic local port range (32768–60999)](https://kernel.org/doc/html/latest/networking/ip-sysctl.html). This is a deployment choice, not an exclusive allocation or a guarantee against conflicts. The application and source templates still default to `8080`; the installation commands below replace that value with `api_port` in both the environment file and Nginx configuration.
+This Ubuntu deployment recommends `61873`: it is in IANA's [Dynamic/Private range (49152–65535)](https://www.iana.org/assignments/service-names-port-numbers), which is not assigned to specific services, and outside Linux's [default automatic local port range (32768–60999)](https://kernel.org/doc/html/latest/networking/ip-sysctl.html). This is a deployment choice, not an exclusive allocation or a guarantee against conflicts. The application and source templates default to `61873`; the installation commands below apply your chosen `api_port` to both the environment file and Nginx configuration.
 
 Use the candidates in the following order. All three satisfy the range criteria above, but no statistical evidence establishes a lower collision rate for any one of them; the VPS's actual configuration and port usage determine suitability.
 
@@ -655,7 +655,7 @@ proxy_backup="/var/backups/courier-hub/nginx-$(date -u +%Y%m%dT%H%M%SZ).conf"
 sudo cp -p /etc/nginx/sites-available/courier-hub "$proxy_backup"
 printf 'Proxy backup: %s\n' "$proxy_backup"
 sed -e "s/api\.example\.com/$api_domain/g" \
-  -e "s/127\.0\.0\.1:8080/127.0.0.1:$api_port/g" \
+  -e "s/127\.0\.0\.1:61873/127.0.0.1:$api_port/g" \
   deploy/ubuntu/nginx.conf | sudo tee /etc/nginx/sites-available/courier-hub > /dev/null
 if ! sudo nginx -t || ! sudo systemctl reload nginx; then
   sudo cp -p "$proxy_backup" /etc/nginx/sites-available/courier-hub

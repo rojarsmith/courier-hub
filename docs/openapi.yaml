@@ -8,7 +8,7 @@ info:
     queue does not imply SMTP acceptance or inbox delivery. One configured SMTP
     account and one shared API key per process.
 servers:
-  - url: http://127.0.0.1:8080
+  - url: http://127.0.0.1:61873
 security:
   - bearerAuth: []
 paths:

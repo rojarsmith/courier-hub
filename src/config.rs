@@ -104,7 +104,7 @@ impl Config {
         );
         Ok(Self {
             bind: read("BIND_ADDR")
-                .unwrap_or_else(|| "127.0.0.1:8080".into())
+                .unwrap_or_else(|| "127.0.0.1:61873".into())
                 .parse()
                 .context("invalid BIND_ADDR")?,
             api_key,

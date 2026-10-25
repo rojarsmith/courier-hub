@@ -90,7 +90,7 @@ openssl rand -hex 32
 cargo run --locked
 ```
 
-預設只監聽 `127.0.0.1:8080`。正式部署使用 `cargo build --release --locked`，Windows 執行 `target/release/courier-hub.exe`；Linux/macOS 執行 `target/release/courier-hub`。每個平台各自建置，不能拿 Windows exe 直接在 Linux 執行。
+預設只監聽 `127.0.0.1:61873`。正式部署使用 `cargo build --release --locked`，Windows 執行 `target/release/courier-hub.exe`；Linux/macOS 執行 `target/release/courier-hub`。每個平台各自建置，不能拿 Windows exe 直接在 Linux 執行。
 
 Windows/Linux/macOS 的 GitHub Actions 測試矩陣已設定；本次本機驗證環境為 Windows。啟動時會建立私人 `data/` 目錄與 SQLite 資料庫，Ctrl+C 停止接新工作並等待目前寄送完成；Unix 也處理 SIGTERM。
 
@@ -109,23 +109,23 @@ $body = @{
     subject = '測試非同步寄信'
     text = '這封信由 Courier Hub 轉送。'
 } | ConvertTo-Json
-$job = Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8080/v1/emails' `
+$job = Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:61873/v1/emails' `
     -Headers $headers -ContentType 'application/json; charset=utf-8' `
     -Body ([System.Text.Encoding]::UTF8.GetBytes($body))
 $job
-Invoke-RestMethod -Uri "http://127.0.0.1:8080/v1/jobs/$($job.id)" -Headers $headers
+Invoke-RestMethod -Uri "http://127.0.0.1:61873/v1/jobs/$($job.id)" -Headers $headers
 ```
 
 Linux/macOS（`COURIER_API_KEY` 由客戶端的私人設定提供）：
 
 ```sh
-curl -i http://127.0.0.1:8080/v1/emails \
+curl -i http://127.0.0.1:61873/v1/emails \
   -H "Authorization: Bearer $COURIER_API_KEY" \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: example-request-001' \
   --data '{"to":["recipient@example.com"],"subject":"Hello","text":"Hello from Courier Hub"}'
 
-curl http://127.0.0.1:8080/v1/jobs/WORK_ID \
+curl http://127.0.0.1:61873/v1/jobs/WORK_ID \
   -H "Authorization: Bearer $COURIER_API_KEY"
 ```
 
@@ -369,7 +369,7 @@ SMTP 信件以 MIME alternative 提供純文字／HTML，以 related 將 CID 圖
 | 環境變數 | 預設／範圍 |
 | --- | --- |
 | `API_KEY` | 必填，32～256 個可列印且無空白的 ASCII 字元；建議產生 32 random bytes 的 hex 值 |
-| `BIND_ADDR` | `127.0.0.1:8080`，IP:port |
+| `BIND_ADDR` | `127.0.0.1:61873`，IP:port |
 | `DATA_DIR` | `data`，私人本機資料目錄 |
 | `SMTP_HOST` | 必填，SMTP DNS hostname |
 | `SMTP_PORT` | STARTTLS 預設 587，implicit 預設 465；1～65535 |
@@ -463,7 +463,7 @@ api_domain=api.example.com
 api_port=61873
 ```
 
-此 Ubuntu 部署建議使用 `61873`：它位於 IANA 的[動態／私人使用範圍（49152–65535）](https://www.iana.org/assignments/service-names-port-numbers)，不分配給特定服務，且位於 Linux [預設自動分配本機連接埠範圍（32768–60999）](https://kernel.org/doc/html/latest/networking/ip-sysctl.html)之外。這是部署選擇，不是專屬分配，也不保證不會衝突。程式與原始範本仍預設使用 `8080`；下方安裝指令會將環境檔與 Nginx 設定同步替換成 `api_port`。
+此 Ubuntu 部署建議使用 `61873`：它位於 IANA 的[動態／私人使用範圍（49152–65535）](https://www.iana.org/assignments/service-names-port-numbers)，不分配給特定服務，且位於 Linux [預設自動分配本機連接埠範圍（32768–60999）](https://kernel.org/doc/html/latest/networking/ip-sysctl.html)之外。這是部署選擇，不是專屬分配，也不保證不會衝突。程式與原始範本預設使用 `61873`；下方安裝指令會將環境檔與 Nginx 設定同步設為所選的 `api_port`。
 
 候選連接埠依選用順序如下；三者皆符合上述範圍條件，但沒有統計證據顯示其中一個的衝突率較低，最後以 VPS 實際配置與占用情況為準。
 
@@ -655,7 +655,7 @@ proxy_backup="/var/backups/courier-hub/nginx-$(date -u +%Y%m%dT%H%M%SZ).conf"
 sudo cp -p /etc/nginx/sites-available/courier-hub "$proxy_backup"
 printf 'Proxy backup: %s\n' "$proxy_backup"
 sed -e "s/api\.example\.com/$api_domain/g" \
-  -e "s/127\.0\.0\.1:8080/127.0.0.1:$api_port/g" \
+  -e "s/127\.0\.0\.1:61873/127.0.0.1:$api_port/g" \
   deploy/ubuntu/nginx.conf | sudo tee /etc/nginx/sites-available/courier-hub > /dev/null
 if ! sudo nginx -t || ! sudo systemctl reload nginx; then
   sudo cp -p "$proxy_backup" /etc/nginx/sites-available/courier-hub
