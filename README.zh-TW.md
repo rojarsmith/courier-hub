@@ -448,6 +448,10 @@ cgroup 檔案系統應顯示 `cgroup2`。本次相容性審閱未發現服務／
 
 ### 1. 準備 DNS、套件與防火牆
 
+**先選擇部署情境：** 全新 VPS 才安裝並啟用新的 Nginx／UFW；已有網站的 VPS 沿用現有入口、防火牆與憑證管理工具，只新增 Courier Hub 站台。同一套 Nginx 可依 `server_name` 讓不同網域共用 80／443，通常不需修改其他站台。但共用 Nginx 的設定驗證、reload 與主機資源仍會互相影響，不是完全隔離的部署。
+
+以下代理指令只適用於 **Ubuntu 主機上的 Nginx，且 `sites-enabled/*` 被載入於 `http {}` 內**。如果入口由 Docker、Nginx Proxy Manager、Apache、Caddy 或管理面板控制，請在原有入口新增網域、TLS 與 upstream，不要再安裝／啟動另一個占用 80／443 的 Nginx。容器內的 `127.0.0.1` 指向容器本身，不能直接套用本範本；需依既有容器網路設定可達的後端位址。
+
 將 API 網域（例如 `api.example.com`）的 DNS A 紀錄指向 VPS 公開 IP。只有伺服器確實能使用公開 IPv6 時才加入 AAAA 紀錄。第一次申請憑證時，DNS 與 CDN／代理必須讓 ACME 驗證路徑的 HTTP 請求到達 VPS。將下方的 `api.example.com` 改成自己的網域，並在同一個 Bash 工作階段完成部署。
 
 ```sh
@@ -456,18 +460,53 @@ ssh ubuntu@VPS_IP
 
 # 以下指令在 Ubuntu 執行。
 api_domain=api.example.com
+api_port=8080
+```
+
+**部署前盤點（兩種情境都要做）：**
+
+```sh
+sudo ss -ltnp
+command -v nginx certbot || true
+if command -v nginx >/dev/null; then sudo nginx -t && sudo nginx -T; fi
+if command -v ufw >/dev/null; then sudo ufw status verbose; fi
+if command -v snap >/dev/null; then snap list certbot; fi
+systemctl list-timers --all
+sudo ls -ld /opt/courier-hub /etc/courier-hub /var/lib/courier-hub \
+  /etc/systemd/system/courier-hub.service \
+  /etc/nginx/sites-available/courier-hub /etc/nginx/sites-enabled/courier-hub
+getent passwd courier-hub
+```
+
+未安裝套件或尚未建立的路徑回報不存在是正常的；其他錯誤需先處理。`nginx -T` 可能包含私人設定，只在自己的終端檢視。確認：
+
+- 所選 `api_port` 未被其他服務占用（包括 `0.0.0.0`／IPv6 wildcard）。若 8080 已使用，改成例如 `api_port=18080`；後續設定與檢查共用這個值。只使用 1024～65535 的整數，網域使用實際 ASCII DNS hostname，不含 scheme、連接埠、路徑或萬用字元。
+- 新網域沒有既有的同名 `server_name` 或憑證用途；保留既有 default server，避免新增檔案的載入順序改變未匹配網域的路由。檢查 `courier_hub_per_ip`、`CourierHubTLS` 名稱未被其他設定使用，且主機支援範本的 IPv6 listen。
+- 若上述 Courier Hub 路徑或帳號已存在，先確認是否為既有部署；既有部署走第 8 節更新流程，不重跑初次安裝。
+- 記錄現有網站的 HTTPS 健康檢查 URL、狀態與代表性內容，部署後以相同方式比較；單看 `nginx -t` 不足以驗證路由正確。
+
+**兩種情境共用的建置套件：**
+
+```sh
 sudo apt update
-sudo apt install -y build-essential curl git ca-certificates pkg-config nginx ufw snapd openssl procps
+sudo apt install -y build-essential curl git ca-certificates pkg-config openssl procps
+```
+
+**僅全新 VPS、沒有既有入口／防火牆管理工具時執行：** 已有網站的主機跳過這段，使用現有管理方式確認 80／443 可達。不要為了本服務重設或啟用另一套防火牆。
+
+```sh
+sudo apt install -y nginx ufw
 
 # 啟用 UFW 前，先放行實際使用的 SSH 連接埠。
 sudo ufw allow OpenSSH
 sudo ufw allow 80/tcp
 sudo ufw allow 443/tcp
+# 先補齊其他所有必須對外服務的連接埠，再啟用。
 sudo ufw enable
 sudo ufw status
 ```
 
-若 SSH 不是使用 22，啟用防火牆前先放行正確連接埠，並確認第二個 SSH 連線可成功登入。VPS 供應商的防火牆也要開放對應的 inbound 規則。不要開放 8080 對外連線。VPS 另外需要能向郵件供應商的 SMTP submission 連接埠（通常 587 或 465）建立 outbound 連線；失敗時確認供應商是否限制 SMTP。UFW 操作依據 [Ubuntu 防火牆文件](https://ubuntu.com/server/docs/how-to/security/firewalls/)。
+若 SSH 不是使用 22，啟用防火牆前先放行正確連接埠，並確認第二個 SSH 連線可成功登入。VPS 供應商的防火牆也要開放對應的 inbound 規則。不要開放所選後端連接埠（`api_port`）對外連線。VPS 另外需要能向郵件供應商的 SMTP submission 連接埠（通常 587 或 465）建立 outbound 連線；失敗時確認供應商是否限制 SMTP。UFW 操作依據 [Ubuntu 防火牆文件](https://ubuntu.com/server/docs/how-to/security/firewalls/)。
 
 ### 2. 建置 Linux 執行檔
 
@@ -492,16 +531,27 @@ cargo build --release --locked
 在原始碼目錄執行。以下建立帳號與安裝設定的指令適用於第一次部署；之後更新請使用下方的更新流程。
 
 ```sh
+(
+set -euo pipefail
+: "${api_port:?Set api_port in step 1}"
+for path in /opt/courier-hub /etc/courier-hub /var/lib/courier-hub /etc/systemd/system/courier-hub.service; do
+  if sudo test -e "$path" || sudo test -L "$path"; then
+    echo "Already exists: $path; inspect before installing." >&2
+    exit 1
+  fi
+done
 sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin courier-hub
 sudo install -d -o root -g root -m 755 /opt/courier-hub
 sudo install -o root -g root -m 755 target/release/courier-hub /opt/courier-hub/courier-hub
 sudo install -d -o root -g root -m 700 /etc/courier-hub
 sudo install -o root -g root -m 600 deploy/ubuntu/.env.example /etc/courier-hub/service.env
+sudo sed -i "s/^BIND_ADDR=.*/BIND_ADDR=127.0.0.1:$api_port/" /etc/courier-hub/service.env
 openssl rand -hex 32
 sudo nano /etc/courier-hub/service.env
+)
 ```
 
-將產生的值填入 `API_KEY`，並替換所有 SMTP 帳號佔位值。保留 `BIND_ADDR=127.0.0.1:8080` 與 `DATA_DIR=/var/lib/courier-hub`。私人設定檔在 Git 之外，不要將內容寫進部署腳本或 commit。Gmail 應用程式密碼與自有網域信箱設定請參考前面的 SMTP 章節。
+將產生的值填入 `API_KEY`，並替換所有 SMTP 帳號佔位值。`BIND_ADDR` 由上方安裝步驟填入所選連接埠，保留 `DATA_DIR=/var/lib/courier-hub`。環境檔內必須是實際數字，例如 `BIND_ADDR=127.0.0.1:18080`，不能填 `$api_port`。私人設定檔在 Git 之外，不要將內容寫進部署腳本或 commit。Gmail 應用程式密碼與自有網域信箱設定請參考前面的 SMTP 章節。
 
 此檔案使用 systemd `EnvironmentFile` 格式：每行 `KEY=value`，不加 `export`，也不做指令替換或變數展開。含空格的值要加引號，例如 `SMTP_FROM="Courier Hub <sender@example.com>"`。systemd 會在啟動低權限程序之前讀取 root 專用檔案；不要在 shell 中 `source` 它。本部署方式透過環境變數注入設定，不需要建立 `/opt/courier-hub/.env`。
 
@@ -513,7 +563,7 @@ sudo systemd-analyze verify /etc/systemd/system/courier-hub.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now courier-hub
 sudo systemctl status courier-hub --no-pager
-curl --fail --silent --show-error http://127.0.0.1:8080/healthz
+curl --fail --silent --show-error "http://127.0.0.1:${api_port:?Set api_port}/healthz"
 ```
 
 [服務範本](deploy/ubuntu/courier-hub.service) 會建立私人資料目錄、將檔案寫入限制在該目錄與私人暫存空間，並以 `courier-hub` 帳號執行。停止逾時設為 150 秒，讓應用程式最長 120 秒的 SMTP 嘗試有時間結束。`/healthz` 應回傳 `{"status":"ok"}`；它只檢查 API／資料庫，不會驗證 SMTP 帳密。環境變數與檔案系統選項見 [systemd 文件](https://github.com/systemd/systemd/blob/v255/man/systemd.exec.xml)。
@@ -523,15 +573,46 @@ curl --fail --silent --show-error http://127.0.0.1:8080/healthz
 先安裝 [HTTP 初始化範本](deploy/ubuntu/nginx-http.conf)。這個範本只提供 ACME 驗證檔案，其餘請求轉向 HTTPS，因此在申請憑證期間不會透過明文 HTTP 開放 API。
 
 ```sh
-sudo install -d -o root -g root -m 755 /var/www/certbot
+(
+set -euo pipefail
+: "${api_domain:?Set api_domain in step 1}"
+for path in /etc/nginx/sites-available/courier-hub /etc/nginx/sites-enabled/courier-hub; do
+  if sudo test -e "$path" || sudo test -L "$path"; then
+    echo "Already exists: $path; inspect before installing." >&2
+    exit 1
+  fi
+done
+sudo nginx -t
+sudo install -d -o root -g root -m 755 /var/www/courier-hub-acme
 sed "s/api\.example\.com/$api_domain/g" deploy/ubuntu/nginx-http.conf | sudo tee /etc/nginx/sites-available/courier-hub > /dev/null
 sudo ln -s /etc/nginx/sites-available/courier-hub /etc/nginx/sites-enabled/courier-hub
-sudo nginx -t
-sudo systemctl enable --now nginx
-sudo systemctl reload nginx
+if ! sudo nginx -t; then
+  sudo unlink /etc/nginx/sites-enabled/courier-hub
+  exit 1
+fi
+)
+```
 
+全新主機若 Nginx 尚未執行，先在設定測試成功後執行 `sudo systemctl enable --now nginx`，再執行下方 reload。既有主機維持原本的啟動管理方式。若 reload 失敗，先處理錯誤，不繼續申請憑證。
+
+```sh
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+**沿用憑證工具：** 已有 Certbot 時，將 `certbot_bin` 設為實際可執行檔的絕對路徑（例如 `/usr/bin/certbot` 或 `/snap/bin/certbot`），先用 `sudo "$certbot_bin" certificates` 檢查；不要另外安裝第二套。已有其他 ACME 工具或管理面板時，沿用其申請、憑證路徑與續期機制，跳過下方 Certbot 安裝／申請／hook 指令，並調整 HTTPS 範本的兩個憑證路徑。新網域若已有可用憑證，可跳過申請，但仍需確保續期方式可持續使用。
+
+只有**尚未使用憑證管理工具**時才執行：
+
+```sh
+sudo apt install -y snapd
 sudo snap install --classic certbot
-sudo /snap/bin/certbot certonly --webroot -w /var/www/certbot --cert-name "$api_domain" -d "$api_domain"
+certbot_bin=/snap/bin/certbot
+```
+
+使用選定的 Certbot 申請專用憑證：
+
+```sh
+sudo "${certbot_bin:?Set certbot_bin}" certonly --webroot -w /var/www/courier-hub-acme --cert-name "$api_domain" -d "$api_domain"
 ```
 
 完成 Certbot 的 email 與服務條款提示，只有成功取得憑證後才繼續。HTTP-01 驗證需要正確 DNS 與 inbound 80；參考 [Ubuntu TLS 文件](https://ubuntu.com/server/docs/how-to/security/obtain-tls-certificates/) 與 [Certbot 安裝說明](https://certbot.eff.org/instructions?ws=nginx&os=snap)。
@@ -539,16 +620,58 @@ sudo /snap/bin/certbot certonly --webroot -w /var/www/certbot --cert-name "$api_
 接著安裝 [HTTPS 範本](deploy/ubuntu/nginx.conf)，替換 server name 與憑證路徑中的網域：
 
 ```sh
-sed "s/api\.example\.com/$api_domain/g" deploy/ubuntu/nginx.conf | sudo tee /etc/nginx/sites-available/courier-hub > /dev/null
+(
+set -euo pipefail
+: "${api_domain:?Set api_domain}" "${api_port:?Set api_port}"
 sudo nginx -t
-sudo systemctl reload nginx
+sudo install -d -o root -g root -m 700 /var/backups/courier-hub
+proxy_backup="/var/backups/courier-hub/nginx-$(date -u +%Y%m%dT%H%M%SZ).conf"
+sudo cp -p /etc/nginx/sites-available/courier-hub "$proxy_backup"
+printf 'Proxy backup: %s\n' "$proxy_backup"
+sed -e "s/api\.example\.com/$api_domain/g" \
+  -e "s/127\.0\.0\.1:8080/127.0.0.1:$api_port/g" \
+  deploy/ubuntu/nginx.conf | sudo tee /etc/nginx/sites-available/courier-hub > /dev/null
+if ! sudo nginx -t || ! sudo systemctl reload nginx; then
+  sudo cp -p "$proxy_backup" /etc/nginx/sites-available/courier-hub
+  sudo nginx -t && sudo systemctl reload nginx
+  exit 1
+fi
 curl --fail --silent --show-error "https://$api_domain/healthz"
+)
+```
 
+重新檢查第 1 節記錄的其他網站狀態及內容。若路由／健康檢查失敗，使用上面印出的備份路徑回復本站設定，再測試及 reload：
+
+```sh
+# Replace with the actual backup path printed above.
+proxy_backup=/var/backups/courier-hub/nginx-YYYYMMDDTHHMMSSZ.conf
+sudo cp -p "$proxy_backup" /etc/nginx/sites-available/courier-hub && \
+  sudo nginx -t && sudo systemctl reload nginx
+```
+
+首次部署的備份只有 HTTP ACME／轉址設定，回復後不提供 HTTPS API。若要撤銷首次新增的站台，可 `sudo unlink /etc/nginx/sites-enabled/courier-hub` 後執行 `sudo nginx -t && sudo systemctl reload nginx`；保留設定檔供排查，不動其他站台。修改既有 Courier Hub 站台時也應先備份、驗證後 reload，不能用 HTTP 初始化範本覆蓋運作中的 HTTPS 設定。
+
+**續期：** 已有適用的 Nginx reload hook 時沿用，不重複安裝。只有尚未設定時才執行下段安裝；hook 只在本服務憑證續期時 reload。已改用其他憑證路徑者需同步調整 hook，或使用原有管理工具。
+
+```sh
+(
+set -euo pipefail
+: "${api_domain:?Set api_domain}"
+hook=/etc/letsencrypt/renewal-hooks/deploy/courier-hub-nginx
+if sudo test -e "$hook" || sudo test -L "$hook"; then
+  echo "Existing hook; review it instead of overwriting." >&2
+  exit 1
+fi
 sudo install -d -o root -g root -m 755 /etc/letsencrypt/renewal-hooks/deploy
-sudo install -o root -g root -m 755 deploy/ubuntu/reload-nginx.sh /etc/letsencrypt/renewal-hooks/deploy/courier-hub-nginx
-sudo /snap/bin/certbot renew --dry-run --run-deploy-hooks
+sed "s/api\.example\.com/$api_domain/g" deploy/ubuntu/reload-nginx.sh | sudo tee "$hook" > /dev/null
+sudo chmod 755 "$hook"
+)
+
+sudo "${certbot_bin:?Set certbot_bin}" renew --cert-name "$api_domain" --dry-run --run-deploy-hooks
 systemctl list-timers --all
 ```
+
+此 dry run 限定本站憑證，但既有全域 hooks 仍可能被執行，先檢視其行為。
 
 確認排程中有 Certbot 的自動續期 timer。deploy hook 會在憑證續期後檢查並 reload Nginx，dry run 也會測試該 hook。續期時仍需保留 HTTP ACME 路徑與 80 連接埠；參考 [Certbot 續期文件](https://eff-certbot.readthedocs.io/en/stable/using.html#renewing-certificates)。
 
@@ -601,6 +724,8 @@ sudo systemctl start courier-hub
 
 在 Ubuntu VPS 上以一般管理帳號執行，原始碼目錄以下假設為 `$HOME/courier-hub`。更新前先依上一節備份資料與私人設定。`git pull` 只更新原始碼；必須重新建置、安裝執行檔並重啟服務，執行中的程式才會套用修改。
 
+在新的 shell 執行更新／回復檢查前，先將 `api_port` 設為已安裝 `BIND_ADDR` 的實際連接埠。更新舊代理範本時，保留原本的 ACME webroot（舊版為 `/var/www/certbot`），除非也同步遷移憑證工具的續期設定並通過 dry run；只替換成新的 webroot 會導致續期失敗。
+
 **拉取與建置：** 既有服務會繼續運作。以下子 shell 遇到任何錯誤就停止；若工作目錄有未提交的變更或目前分支不是 `main`，先處理後再更新。
 
 ```sh
@@ -637,7 +762,7 @@ sudo systemctl start courier-hub
 ```sh
 sudo systemctl status courier-hub --no-pager
 sudo journalctl -u courier-hub -n 50 --no-pager
-curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:8080/healthz
+curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 "http://127.0.0.1:${api_port:?Set api_port}/healthz"
 sha256sum "$HOME/courier-hub/target/release/courier-hub" /opt/courier-hub/courier-hub
 ```
 
@@ -655,7 +780,7 @@ sudo systemctl stop courier-hub
 sudo mv /opt/courier-hub/courier-hub.new /opt/courier-hub/courier-hub
 sudo systemctl reset-failed courier-hub
 sudo systemctl start courier-hub
-curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:8080/healthz
+curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 "http://127.0.0.1:${api_port:?Set api_port}/healthz"
 )
 ```
 
@@ -673,7 +798,7 @@ sudo ss -ltnp
 | 現象 | 檢查項目 |
 | --- | --- |
 | 服務啟動失敗 | API key 未填或仍是佔位值、SMTP 設定、root 持有的執行檔、私人設定格式或資料目錄權限。修正重複失敗原因後，執行 `sudo systemctl reset-failed courier-hub` 再啟動。 |
-| Nginx 回傳 502 | 檢查 systemd 與 `curl http://127.0.0.1:8080/healthz`；服務與代理需使用相同的 8080 連接埠。 |
+| Nginx 回傳 502 | 檢查 systemd 與 `curl "http://127.0.0.1:${api_port:?Set api_port}/healthz"`；服務與代理需使用相同的所選連接埠。 |
 | 憑證申請／續期失敗 | 檢查 A／AAAA、兩層防火牆的 80 連接埠、ACME webroot 與 CDN 路由。 |
 | 工作為 failed／unknown | 檢查供應商驗證政策、應用程式密碼、TLS 模式與 outbound SMTP 限制；`/healthz` 不測試 SMTP。 |
 | 請求回傳 413／429 | 檢查代理的 body／每 IP 限流，以及 API 本身的 body／key 上限。 |

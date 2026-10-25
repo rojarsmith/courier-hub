@@ -448,6 +448,10 @@ Expect `cgroup2` for the cgroup filesystem. This compatibility review found no r
 
 ### 1. Prepare DNS, packages, and the firewall
 
+**Choose the deployment path first:** install and enable a new Nginx/UFW only on a fresh VPS. On a VPS with existing sites, reuse its ingress, firewall, and certificate manager and add only the Courier Hub site. One Nginx can share ports 80/443 across hostnames using `server_name`, usually without changing other sites. Configuration validation, reloads, and host resources remain shared; this is not complete isolation.
+
+The proxy commands below require **host-installed Ubuntu Nginx with `sites-enabled/*` included inside `http {}`**. If Docker, Nginx Proxy Manager, Apache, Caddy, or a control panel manages ingress, add the hostname, TLS, and upstream there instead of installing/starting another Nginx on ports 80/443. Inside a container, `127.0.0.1` refers to that container; adapt the upstream to the existing container network rather than copying this template unchanged.
+
 Point an API hostname such as `api.example.com` at the VPS public IP with a DNS A record. Add an AAAA record only if the server has working public IPv6. For initial certificate issuance, DNS and any CDN/proxy must let HTTP requests to the ACME challenge path reach the VPS. Replace `api.example.com` below with your hostname and keep the same Bash session for the deployment commands.
 
 ```sh
@@ -456,18 +460,53 @@ ssh ubuntu@VPS_IP
 
 # Run the remaining commands on Ubuntu.
 api_domain=api.example.com
+api_port=8080
+```
+
+**Preflight inventory (both paths):**
+
+```sh
+sudo ss -ltnp
+command -v nginx certbot || true
+if command -v nginx >/dev/null; then sudo nginx -t && sudo nginx -T; fi
+if command -v ufw >/dev/null; then sudo ufw status verbose; fi
+if command -v snap >/dev/null; then snap list certbot; fi
+systemctl list-timers --all
+sudo ls -ld /opt/courier-hub /etc/courier-hub /var/lib/courier-hub \
+  /etc/systemd/system/courier-hub.service \
+  /etc/nginx/sites-available/courier-hub /etc/nginx/sites-enabled/courier-hub
+getent passwd courier-hub
+```
+
+Missing packages/paths are expected on a fresh machine; resolve other errors before continuing. `nginx -T` can contain private configuration: inspect it only in your own terminal. Confirm:
+
+- The selected `api_port` is free, including wildcard IPv4/IPv6 listeners. If 8080 is taken, choose e.g. `api_port=18080`; subsequent setup and checks use that value. Use an integer from 1024 through 65535 and a real ASCII DNS hostname without a scheme, port, path, or wildcard.
+- The hostname has no existing matching `server_name` or certificate use. Preserve the existing default server so file ordering cannot change unmatched-host routing. Check that `courier_hub_per_ip` and `CourierHubTLS` are unused and that the host supports the template's IPv6 listeners.
+- If any Courier Hub paths or the account already exist, identify them first. Use step 8 for an existing deployment instead of repeating initial installation.
+- Record existing sites' HTTPS health URLs, status, and representative content; repeat those checks after deployment. `nginx -t` alone does not verify routing.
+
+**Build packages for both paths:**
+
+```sh
 sudo apt update
-sudo apt install -y build-essential curl git ca-certificates pkg-config nginx ufw snapd openssl procps
+sudo apt install -y build-essential curl git ca-certificates pkg-config openssl procps
+```
+
+**Only on a fresh VPS without existing ingress/firewall management:** skip this block on an existing web host and check access to 80/443 through its current management tools. Do not reset or enable another firewall for this service.
+
+```sh
+sudo apt install -y nginx ufw
 
 # Allow your actual SSH port BEFORE enabling UFW.
 sudo ufw allow OpenSSH
 sudo ufw allow 80/tcp
 sudo ufw allow 443/tcp
+# Allow every other required public service port before enabling.
 sudo ufw enable
 sudo ufw status
 ```
 
-If SSH uses a port other than 22, allow that port before enabling the firewall and confirm a second SSH connection works. Apply equivalent inbound rules in the VPS provider's firewall. Do not expose port 8080. The VPS must also permit outbound connections to your provider's SMTP submission port, usually 587 or 465; check provider restrictions if these connections fail. UFW setup follows the [Ubuntu firewall guide](https://ubuntu.com/server/docs/how-to/security/firewalls/).
+If SSH uses a port other than 22, allow that port before enabling the firewall and confirm a second SSH connection works. Apply equivalent inbound rules in the VPS provider's firewall. Do not expose the selected backend port (`api_port`). The VPS must also permit outbound connections to your provider's SMTP submission port, usually 587 or 465; check provider restrictions if these connections fail. UFW setup follows the [Ubuntu firewall guide](https://ubuntu.com/server/docs/how-to/security/firewalls/).
 
 ### 2. Build the Linux executable
 
@@ -492,16 +531,27 @@ For a private repository, configure a dedicated read-only [GitHub deploy key](ht
 Run from the source checkout. These account and configuration installation commands are for the first deployment; for later releases, use the update procedure below.
 
 ```sh
+(
+set -euo pipefail
+: "${api_port:?Set api_port in step 1}"
+for path in /opt/courier-hub /etc/courier-hub /var/lib/courier-hub /etc/systemd/system/courier-hub.service; do
+  if sudo test -e "$path" || sudo test -L "$path"; then
+    echo "Already exists: $path; inspect before installing." >&2
+    exit 1
+  fi
+done
 sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin courier-hub
 sudo install -d -o root -g root -m 755 /opt/courier-hub
 sudo install -o root -g root -m 755 target/release/courier-hub /opt/courier-hub/courier-hub
 sudo install -d -o root -g root -m 700 /etc/courier-hub
 sudo install -o root -g root -m 600 deploy/ubuntu/.env.example /etc/courier-hub/service.env
+sudo sed -i "s/^BIND_ADDR=.*/BIND_ADDR=127.0.0.1:$api_port/" /etc/courier-hub/service.env
 openssl rand -hex 32
 sudo nano /etc/courier-hub/service.env
+)
 ```
 
-Set `API_KEY` to the generated value and replace all SMTP account placeholders. Keep `BIND_ADDR=127.0.0.1:8080` and `DATA_DIR=/var/lib/courier-hub`. The private file is outside Git; never put its contents in deployment scripts or commits. See the SMTP setup section for Gmail app passwords or your domain mailbox provider's settings.
+Set `API_KEY` to the generated value and replace all SMTP account placeholders. The installation block fills `BIND_ADDR` with your chosen port; keep `DATA_DIR=/var/lib/courier-hub`. The environment file must contain the actual number, e.g. `BIND_ADDR=127.0.0.1:18080`, not `$api_port`. The private file is outside Git; never put its contents in deployment scripts or commits. See the SMTP setup section for Gmail app passwords or your domain mailbox provider's settings.
 
 The file uses systemd `EnvironmentFile` syntax: one `KEY=value` per line, without `export`, command substitution, or variable expansion. Quote a value containing spaces, for example `SMTP_FROM="Courier Hub <sender@example.com>"`. systemd reads the root-only file before starting the unprivileged process; do not `source` it in a shell. This deployment uses environment injection and does not need `/opt/courier-hub/.env`.
 
@@ -513,7 +563,7 @@ sudo systemd-analyze verify /etc/systemd/system/courier-hub.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now courier-hub
 sudo systemctl status courier-hub --no-pager
-curl --fail --silent --show-error http://127.0.0.1:8080/healthz
+curl --fail --silent --show-error "http://127.0.0.1:${api_port:?Set api_port}/healthz"
 ```
 
 The [service template](deploy/ubuntu/courier-hub.service) creates the private state directory, restricts filesystem writes to that directory and private temporary storage, and runs as `courier-hub`. Its 150-second stop timeout allows the application's maximum 120-second SMTP attempt to finish. `/healthz` should return `{"status":"ok"}`; it checks the API/database, not SMTP credentials. Environment and filesystem options are documented by [systemd](https://github.com/systemd/systemd/blob/v255/man/systemd.exec.xml).
@@ -523,15 +573,46 @@ The [service template](deploy/ubuntu/courier-hub.service) creates the private st
 First install the [HTTP bootstrap configuration](deploy/ubuntu/nginx-http.conf). It serves only ACME challenge files and redirects other requests toward HTTPS, so the API is not exposed over plaintext HTTP while the certificate is being obtained.
 
 ```sh
-sudo install -d -o root -g root -m 755 /var/www/certbot
+(
+set -euo pipefail
+: "${api_domain:?Set api_domain in step 1}"
+for path in /etc/nginx/sites-available/courier-hub /etc/nginx/sites-enabled/courier-hub; do
+  if sudo test -e "$path" || sudo test -L "$path"; then
+    echo "Already exists: $path; inspect before installing." >&2
+    exit 1
+  fi
+done
+sudo nginx -t
+sudo install -d -o root -g root -m 755 /var/www/courier-hub-acme
 sed "s/api\.example\.com/$api_domain/g" deploy/ubuntu/nginx-http.conf | sudo tee /etc/nginx/sites-available/courier-hub > /dev/null
 sudo ln -s /etc/nginx/sites-available/courier-hub /etc/nginx/sites-enabled/courier-hub
-sudo nginx -t
-sudo systemctl enable --now nginx
-sudo systemctl reload nginx
+if ! sudo nginx -t; then
+  sudo unlink /etc/nginx/sites-enabled/courier-hub
+  exit 1
+fi
+)
+```
 
+On a fresh host where Nginx is not running, run `sudo systemctl enable --now nginx` after the configuration test succeeds, then reload as below. Preserve existing service management on an established host. Resolve reload failures before requesting a certificate.
+
+```sh
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+**Reuse certificate management:** if Certbot is already installed, set `certbot_bin` to its actual absolute executable path (e.g. `/usr/bin/certbot` or `/snap/bin/certbot`) and inspect `sudo "$certbot_bin" certificates`; do not install a second copy. If another ACME tool or control panel manages certificates, retain its issuance, paths, and renewal process. Skip the Certbot installation/issuance/hook commands below and adapt both certificate paths in the HTTPS template. An existing suitable certificate can be reused without issuance, provided its renewal method remains functional.
+
+Run this only when **no certificate manager is already in use**:
+
+```sh
+sudo apt install -y snapd
 sudo snap install --classic certbot
-sudo /snap/bin/certbot certonly --webroot -w /var/www/certbot --cert-name "$api_domain" -d "$api_domain"
+certbot_bin=/snap/bin/certbot
+```
+
+Request a dedicated certificate with the selected Certbot:
+
+```sh
+sudo "${certbot_bin:?Set certbot_bin}" certonly --webroot -w /var/www/courier-hub-acme --cert-name "$api_domain" -d "$api_domain"
 ```
 
 Complete Certbot's email and terms prompts. Continue only after certificate issuance succeeds. HTTP-01 needs inbound port 80 and correct DNS; see [Ubuntu's TLS guide](https://ubuntu.com/server/docs/how-to/security/obtain-tls-certificates/) and [Certbot's installation instructions](https://certbot.eff.org/instructions?ws=nginx&os=snap).
@@ -539,16 +620,58 @@ Complete Certbot's email and terms prompts. Continue only after certificate issu
 Then install the [HTTPS configuration](deploy/ubuntu/nginx.conf), substituting the hostname in both the server name and certificate paths:
 
 ```sh
-sed "s/api\.example\.com/$api_domain/g" deploy/ubuntu/nginx.conf | sudo tee /etc/nginx/sites-available/courier-hub > /dev/null
+(
+set -euo pipefail
+: "${api_domain:?Set api_domain}" "${api_port:?Set api_port}"
 sudo nginx -t
-sudo systemctl reload nginx
+sudo install -d -o root -g root -m 700 /var/backups/courier-hub
+proxy_backup="/var/backups/courier-hub/nginx-$(date -u +%Y%m%dT%H%M%SZ).conf"
+sudo cp -p /etc/nginx/sites-available/courier-hub "$proxy_backup"
+printf 'Proxy backup: %s\n' "$proxy_backup"
+sed -e "s/api\.example\.com/$api_domain/g" \
+  -e "s/127\.0\.0\.1:8080/127.0.0.1:$api_port/g" \
+  deploy/ubuntu/nginx.conf | sudo tee /etc/nginx/sites-available/courier-hub > /dev/null
+if ! sudo nginx -t || ! sudo systemctl reload nginx; then
+  sudo cp -p "$proxy_backup" /etc/nginx/sites-available/courier-hub
+  sudo nginx -t && sudo systemctl reload nginx
+  exit 1
+fi
 curl --fail --silent --show-error "https://$api_domain/healthz"
+)
+```
 
+Repeat the status/content checks recorded for other sites in step 1. If routing or health checks fail, restore this site's configuration using the backup path printed above, then test and reload:
+
+```sh
+# Replace with the actual backup path printed above.
+proxy_backup=/var/backups/courier-hub/nginx-YYYYMMDDTHHMMSSZ.conf
+sudo cp -p "$proxy_backup" /etc/nginx/sites-available/courier-hub && \
+  sudo nginx -t && sudo systemctl reload nginx
+```
+
+The first deployment's backup contains only HTTP ACME/redirect configuration, so restoring it does not provide the HTTPS API. To undo the newly added site, run `sudo unlink /etc/nginx/sites-enabled/courier-hub`, followed by `sudo nginx -t && sudo systemctl reload nginx`. Keep the file for investigation and leave other sites intact. Back up before editing an existing Courier Hub site too; do not overwrite a working HTTPS site with the HTTP bootstrap template.
+
+**Renewal:** reuse an existing suitable Nginx reload hook instead of installing another. Run the installation below only if none exists; this hook reloads only for this service's certificate. Adapt the hook if you use different certificate paths, or keep your existing manager.
+
+```sh
+(
+set -euo pipefail
+: "${api_domain:?Set api_domain}"
+hook=/etc/letsencrypt/renewal-hooks/deploy/courier-hub-nginx
+if sudo test -e "$hook" || sudo test -L "$hook"; then
+  echo "Existing hook; review it instead of overwriting." >&2
+  exit 1
+fi
 sudo install -d -o root -g root -m 755 /etc/letsencrypt/renewal-hooks/deploy
-sudo install -o root -g root -m 755 deploy/ubuntu/reload-nginx.sh /etc/letsencrypt/renewal-hooks/deploy/courier-hub-nginx
-sudo /snap/bin/certbot renew --dry-run --run-deploy-hooks
+sed "s/api\.example\.com/$api_domain/g" deploy/ubuntu/reload-nginx.sh | sudo tee "$hook" > /dev/null
+sudo chmod 755 "$hook"
+)
+
+sudo "${certbot_bin:?Set certbot_bin}" renew --cert-name "$api_domain" --dry-run --run-deploy-hooks
 systemctl list-timers --all
 ```
+
+This dry run selects only this certificate, but existing global hooks can still run; inspect their behavior first.
 
 Confirm the Certbot renewal timer is present. The deploy hook checks and reloads Nginx after certificate renewal; the dry run also exercises that hook. Keep the HTTP ACME path and port 80 available for renewals. See [Certbot's renewal documentation](https://eff-certbot.readthedocs.io/en/stable/using.html#renewing-certificates).
 
@@ -601,6 +724,8 @@ Keep backups private and encrypted if required; they contain email content. Back
 
 Run these commands on the Ubuntu VPS as your administrative account, assuming the source checkout is at `$HOME/courier-hub`. Back up data and private settings as described above before updating. `git pull` only updates the source; rebuild, install the executable, and restart the service to apply changes to the running application.
 
+Before update/rollback checks in a new shell, set `api_port` to the actual port in the installed `BIND_ADDR`. When upgrading older proxy templates, retain the existing ACME webroot (previously `/var/www/certbot`) unless you also migrate the certificate manager's renewal configuration and verify it with a dry run. Copying the new webroot alone would break renewal.
+
 **Pull and build:** The existing service keeps running. The subshell stops on any error. Resolve uncommitted changes or switch to `main` before updating if either check fails.
 
 ```sh
@@ -637,7 +762,7 @@ Keep `/etc/courier-hub/service.env` and `/var/lib/courier-hub`; do not overwrite
 ```sh
 sudo systemctl status courier-hub --no-pager
 sudo journalctl -u courier-hub -n 50 --no-pager
-curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:8080/healthz
+curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 "http://127.0.0.1:${api_port:?Set api_port}/healthz"
 sha256sum "$HOME/courier-hub/target/release/courier-hub" /opt/courier-hub/courier-hub
 ```
 
@@ -655,7 +780,7 @@ sudo systemctl stop courier-hub
 sudo mv /opt/courier-hub/courier-hub.new /opt/courier-hub/courier-hub
 sudo systemctl reset-failed courier-hub
 sudo systemctl start courier-hub
-curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:8080/healthz
+curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 "http://127.0.0.1:${api_port:?Set api_port}/healthz"
 )
 ```
 
@@ -673,7 +798,7 @@ sudo ss -ltnp
 | Symptom | Check |
 | --- | --- |
 | Service fails at startup | Missing/placeholder API key, SMTP settings, root-owned executable, private file syntax, or state-directory permissions. After correcting repeated failures, run `sudo systemctl reset-failed courier-hub` then start it. |
-| Nginx returns 502 | Check systemd and `curl http://127.0.0.1:8080/healthz`; both service and proxy must use port 8080. |
+| Nginx returns 502 | Check systemd and `curl "http://127.0.0.1:${api_port:?Set api_port}/healthz"`; both service and proxy must use the same selected port. |
 | Certificate issuance/renewal fails | Check A/AAAA records, port 80 in both firewalls, ACME webroot, and any CDN routing. |
 | Job is failed/unknown | Check provider authentication policy, app password, TLS mode, and outbound SMTP restrictions. `/healthz` does not test SMTP. |
 | Request returns 413/429 | Check the proxy body/per-IP limits and the API's own body/key limits. |
