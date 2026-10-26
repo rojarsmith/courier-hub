@@ -20,6 +20,20 @@
 
 ## 方案比較
 
+### 圖片文字辨識最低需求
+
+2026-10-26 使用者新增必要條件：至少能辨識圖片上有哪些文字。因此前述文字輸入輸出假設擴充為圖片加文字輸入、文字或 JSON 輸出；只支援文字的模型不能單獨滿足需求。第一階段以逐字轉錄為基準，保留原文與換行，不自動翻譯、摘要或補寫看不清的字；文字座標、表格版面還原與手寫辨識品質另行評估。
+
+Groq 的 `qwen/qwen3.8-27b` 官方 vision 文件列出圖片輸入與 OCR 用途，免費限額表列 30 RPM、1,000 RPD、8,000 TPM、200,000 TPD。文件列每張圖計 2,048 input tokens，最多三張圖／請求。若每次一張圖、100 prompt tokens、500 output tokens，忽略額外推理及其他用量，理論上約 75 次／日；不能將 1,000 RPD 解讀為每日可辨識 1,000 張。此模型改列為 Groq OCR 原型候選，先前以 `gpt-oss-120b` 為例的文字 API 推薦不構成圖片能力的證據。[Vision 與 OCR](https://console.groq.com/docs/vision)、[免費限額](https://console.groq.com/docs/rate-limits)
+
+Gemini 支援圖片理解，可作 OCR 對照；實作時選擇帳號當下可用且具免費圖片輸入額度的模型。Cloudflare 的 `llama-3.2-11b-vision-instruct` 可作備選，但先前 3B 純文字模型的免費次數估算不可套用到圖片模型。繁體中文、小字與密集文件的品質須使用相同圖片實測，尚無本專案的品質排名。[Gemini 圖片輸入](https://ai.google.dev/gemini-api/docs/image-understanding)、[Gemini 定價](https://ai.google.dev/gemini-api/docs/pricing)、[Cloudflare Vision](https://developers.cloudflare.com/workers-ai/models/llama-3.2-11b-vision-instruct/)
+
+1GB VPS 優先走圖片上傳 → REST gateway → 雲端 vision API → 本次文字結果，不需本地載入視覺模型或 Chromium。請求新增 `task: ocr` 與圖片輸入；限制檔案大小、解碼像素數及併發，避免原圖、解碼圖及 base64 多份緩衝同時占用 RAM。必要縮圖須檢查小字是否仍可讀，不能只為省流量壓縮到不可辨識。使用模型的圖片用量估算，不能沿用純文字成本。
+
+驗收增加有人工正解的繁中、英文、數字、螢幕截圖、拍照與模糊圖片；比較漏字、錯字、虛構文字、讀取順序、延遲與每張消耗。模型自報 confidence 不當成校準過的可信度；看不清的區域明確標示。免費帳號圖片配額、真實 OCR 品質及敏感圖片的資料政策仍待確認。
+
+### 供應商概覽
+
 | 方案 | 輸入與輸出 | 已查得費用或額度 | 主要限制 | 初步用途 |
 | --- | --- | --- | --- | --- |
 | Gemini API 免費層 | 官方 HTTP API，轉成統一 JSON | 部分模型輸入輸出免費；並非所有模型都可用 | RPM、TPM、RPD 隨模型與專案而異；實際值須讀帳號控制台。免費層資料使用政策需注意 | 一般生成候選 |
