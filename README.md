@@ -916,6 +916,8 @@ Get-Process -Name courier-hub -ErrorAction Stop | Select-Object Id, ProcessName,
 
 ## Development and verification
 
+Research and planning: [Free LLM gateway feasibility study (Traditional Chinese)](docs/research/free-llm-gateway.zh-TW.md), covering free APIs, local models, CLI integration, and Google Search AI Mode bridging. This is a proposal; LLM endpoints are not implemented.
+
 
 ```sh
 cargo fmt --all -- --check

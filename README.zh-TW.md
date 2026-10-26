@@ -916,6 +916,8 @@ Get-Process -Name courier-hub -ErrorAction Stop | Select-Object Id, ProcessName,
 
 ## 開發與驗證
 
+研究與規劃：[免費 LLM 轉接服務可行性研究](docs/research/free-llm-gateway.zh-TW.md)，涵蓋官方免費 API、本機模型、CLI 與 Google Search AI Mode 橋接的成本及驗證計畫。此項仍在評估，尚未提供 LLM 端點。
+
 ```sh
 cargo fmt --all -- --check
 cargo test --locked --all-targets
